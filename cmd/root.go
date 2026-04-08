@@ -162,7 +162,7 @@ func cleanUp(managers []*cf.CloudflareAccountManager, c context.CancelFunc, ctx 
 		})
 	}
 	if err := g.Wait(); err != nil {
-		log.Fatal(err)
+		log.Errorf("cleanup failed: %s", err)
 	}
 }
 
