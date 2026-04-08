@@ -826,10 +826,14 @@ func (m *CloudflareAccountManager) HandleTurnstile() error {
 					widgetTokenCfg.Secret = resp.Secret
 					widgetTokenCfgByDomainLock.Lock()
 					widgetTokenCfgByDomain[zone.Domain] = widgetTokenCfg
-					if err := m.writeWidgetCfgToKV(ctx, widgetTokenCfgByDomain); err != nil {
-						return err
+					snapshot := make(map[string]WidgetTokenCfg, len(widgetTokenCfgByDomain))
+					for k, v := range widgetTokenCfgByDomain {
+						snapshot[k] = v
 					}
 					widgetTokenCfgByDomainLock.Unlock()
+					if err := m.writeWidgetCfgToKV(ctx, snapshot); err != nil {
+						return err
+					}
 				}
 			}
 		})
