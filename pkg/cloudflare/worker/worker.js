@@ -47,8 +47,9 @@ const handleTurnstilePost = async (request, body, turnstile_secret, zoneForThisR
     console.log('Valid captcha solution;', "Issuing JWT token");
     const jwtToken = await jwt.sign({
       data: "captcha solved",
+      ip: ip,
       exp: Math.floor(Date.now() / 1000) + (2 * (60 * 60))
-    }, turnstile_secret + ip);
+    }, turnstile_secret);
     const newResponse = new Response(null, {
       status: 302
     })
@@ -121,8 +122,11 @@ export default {
         console.log("captchaAuth cookie is present")
         // Check if the JWT token is valid
         try {
-          const decoded = await jwt.verify(cookie[`${zoneForThisRequest}_captcha`], turnstileCfg["secret"] + ip, {throwError: true});
-          return fetch(request)
+          const decoded = await jwt.verify(cookie[`${zoneForThisRequest}_captcha`], turnstileCfg["secret"], {throwError: true});
+          if (decoded.payload && decoded.payload.ip === ip) {
+            return fetch(request)
+          }
+          console.log("jwt ip mismatch")
         } catch (err) {
           console.log(err)
         }
