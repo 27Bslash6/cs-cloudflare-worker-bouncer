@@ -6454,7 +6454,7 @@ async function resetAllDecisions(accountId, namespaceId, apiToken, kvNamespace) 
 					env.CF_API_TOKEN,
 					env.CROWDSECCFBOUNCERNS
 				);
-                // No need to handle WARMED_UP flag as there is no decisions at all
+				await markAsWarmed(env.CROWDSECCFBOUNCERNS);
 				const finalDuration = ((Date.now() - startTime) / 1000).toFixed(2);
 				logger.info('KV cleared successfully (LAPI has no decisions)', {
 					totalDuration: `${finalDuration}s`,
