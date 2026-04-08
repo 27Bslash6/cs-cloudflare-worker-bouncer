@@ -7306,17 +7306,21 @@ const writeToKV = async (kv, key, value) => {
 
     const incrementMetrics = async (metricName, ipType, origin, remediation_type) => {
       if (env.CROWDSECCFBOUNCERDB !== undefined) {
-        let parameters = [metricName, origin || "", remediation_type || "", ipType]
-        let query = `
-          INSERT INTO metrics (val, metric_name, origin, remediation_type, ip_type)
-          VALUES (1, ?, ?, ?, ?)
-          ON CONFLICT(metric_name, origin, remediation_type, ip_type) DO UPDATE SET val=val+1
-        `;
+        try {
+          let parameters = [metricName, origin || "", remediation_type || "", ipType]
+          let query = `
+            INSERT INTO metrics (val, metric_name, origin, remediation_type, ip_type)
+            VALUES (1, ?, ?, ?, ?)
+            ON CONFLICT(metric_name, origin, remediation_type, ip_type) DO UPDATE SET val=val+1
+          `;
 
-        await env.CROWDSECCFBOUNCERDB
-          .prepare(query)
-          .bind(...parameters)
-          .run();
+          await env.CROWDSECCFBOUNCERDB
+            .prepare(query)
+            .bind(...parameters)
+            .run();
+        } catch (e) {
+          console.error('Failed to write metrics to D1, continuing:', e.message);
+        }
 
       };
     }
