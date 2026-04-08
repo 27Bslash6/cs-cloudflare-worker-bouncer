@@ -528,6 +528,14 @@ func (m *CloudflareAccountManager) ProcessDeletedDecisions(decisions []*models.D
 		newKVPairByValue[kvPair.Key] = kvPair
 	}
 
+	// Collect metric labels to decrement after successful KV delete
+	type metricDec struct {
+		labels prometheus.Labels
+	}
+	pendingRangeDecs := make([]metricDec, 0)
+	pendingIPDecs := make([]metricDec, 0)
+	rangeDeletes := make([]string, 0) // range keys to delete from ActionByIPRange
+
 	for _, decision := range decisions {
 		origin := *decision.Origin
 		if origin == "lists" {
@@ -539,8 +547,10 @@ func (m *CloudflareAccountManager) ProcessDeletedDecisions(decisions []*models.D
 				if strings.Contains(*decision.Value, ":") {
 					ipType = "ipv6"
 				}
-				metrics.TotalActiveDecisions.With(prometheus.Labels{"origin": origin, "ip_type": ipType, "scope": *decision.Scope, "account": m.AccountCfg.Name}).Dec()
-				delete(m.ActionByIPRange, *decision.Value)
+				pendingRangeDecs = append(pendingRangeDecs, metricDec{
+					labels: prometheus.Labels{"origin": origin, "ip_type": ipType, "scope": *decision.Scope, "account": m.AccountCfg.Name},
+				})
+				rangeDeletes = append(rangeDeletes, *decision.Value)
 			}
 			continue
 		}
@@ -554,17 +564,19 @@ func (m *CloudflareAccountManager) ProcessDeletedDecisions(decisions []*models.D
 				} else {
 					ipType = "N/A"
 				}
-				metrics.TotalActiveDecisions.With(prometheus.Labels{"origin": origin, "ip_type": ipType, "scope": *decision.Scope, "account": m.AccountCfg.Name}).Dec()
+				pendingIPDecs = append(pendingIPDecs, metricDec{
+					labels: prometheus.Labels{"origin": origin, "ip_type": ipType, "scope": *decision.Scope, "account": m.AccountCfg.Name},
+				})
 				keysToDelete = append(keysToDelete, val.Key)
 				delete(newKVPairByValue, val.Key)
 			}
 		}
 	}
-	if len(keysToDelete) == 0 {
+	if len(keysToDelete) == 0 && len(rangeDeletes) == 0 {
 		m.logger.Debug("No keys to delete")
 		return nil
 	}
-	m.logger.Infof("Deleting %d decisions", len(keysToDelete))
+	m.logger.Infof("Deleting %d decisions", len(keysToDelete)+len(rangeDeletes))
 	deleterGrp := errgroup.Group{}
 	// Cloudflare API only allows deleting 10k keys at a time. So we need to batch the deletes.
 	for batch, i := 0, 0; i < len(keysToDelete); i += 10000 {
@@ -586,7 +598,18 @@ func (m *CloudflareAccountManager) ProcessDeletedDecisions(decisions []*models.D
 	if err := deleterGrp.Wait(); err != nil {
 		return err
 	}
-	m.logger.Infof("Deleted %d decisions", len(keysToDelete))
+	// Apply deferred metric decrements only after successful KV delete
+	for _, dec := range pendingIPDecs {
+		metrics.TotalActiveDecisions.With(dec.labels).Dec()
+	}
+	for _, dec := range pendingRangeDecs {
+		metrics.TotalActiveDecisions.With(dec.labels).Dec()
+	}
+	// Apply deferred range deletions
+	for _, key := range rangeDeletes {
+		delete(m.ActionByIPRange, key)
+	}
+	m.logger.Infof("Deleted %d decisions", len(keysToDelete)+len(rangeDeletes))
 	m.KVPairByDecisionValue = newKVPairByValue
 	m.updateMetrics()
 	return m.CommitIPRangesIfChanged()
