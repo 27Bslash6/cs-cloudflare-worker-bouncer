@@ -4,13 +4,14 @@ import { parse } from "cookie";
 
 
 const getZoneFromReqURL = (reqURL, actionsByDomain) => {
-  // loop through
-  for (const [domain] of Object.entries(actionsByDomain)) {
-    // if the request URL contains the domain, return the actions
-    if (reqURL.includes(domain)) {
-      return domain
+  try {
+    const hostname = new URL(reqURL).hostname;
+    for (const [domain] of Object.entries(actionsByDomain)) {
+      if (hostname === domain || hostname.endsWith('.' + domain)) {
+        return domain
+      }
     }
-  }
+  } catch (e) { /* invalid URL */ }
 }
 
 const getSupportedActionForZone = (action, actionsForDomain) => {
