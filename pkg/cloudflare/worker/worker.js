@@ -105,9 +105,7 @@ export default {
         return fetch(request)
       }
       if (typeof turnstileCfg === "string") {
-        console.log("Converting turnstile config to JSON")
         turnstileCfg = JSON.parse(turnstileCfg)
-        writeToKV(env.CROWDSECCFBOUNCERNS, "TURNSTILE_CONFIG", turnstileCfg)
       }
 
       if (!turnstileCfg[zoneForThisRequest]) {
