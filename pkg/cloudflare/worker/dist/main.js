@@ -7116,13 +7116,7 @@ const handleTurnstilePost = async (request, body, turnstile_secret, zoneForThisR
 }
 
 const getFromKV = async (kv, key) => {
-  try {
-    const value = await kv.get(key);
-    return value;
-  } catch (e) {
-    console.log(e)
-    return null
-  }
+  return await kv.get(key);
 }
 
 const writeToKV = async (kv, key, value) => {
@@ -7327,7 +7321,13 @@ const writeToKV = async (kv, key, value) => {
     await incrementMetrics("processed", ipType)
 
 
-    let remediation = await getRemediationForRequest(request, env)
+    let remediation;
+    try {
+      remediation = await getRemediationForRequest(request, env)
+    } catch (e) {
+      console.error("KV lookup failed, failing closed:", e.message);
+      return new Response("Service temporarily unavailable", { status: 503 });
+    }
     if (remediation === null) {
       console.log("No remediation found for request")
       return fetch(request)
