@@ -6437,6 +6437,13 @@ async function resetAllDecisions(accountId, namespaceId, apiToken, kvNamespace) 
 				origins,
 			});
 
+			// Mark warmed immediately after successful LAPI fetch, before KV writes.
+			// This prevents perpetual full-sync storms if KV writes fail on large blocklists.
+			if (isFirst) {
+				await markAsWarmed(env.CROWDSECCFBOUNCERNS);
+				logger.info('Cache marked as warmed after successful LAPI fetch');
+			}
+
 			// Log summary
 			const duration = ((Date.now() - startTime) / 1000).toFixed(2);
 			logger.info('Decision stream completed successfully', {
@@ -6531,12 +6538,6 @@ async function resetAllDecisions(accountId, namespaceId, apiToken, kvNamespace) 
 				logger.info('IP_RANGES changed, updating KV...');
 				await writeIpRanges(env.CROWDSECCFBOUNCERNS, finalRanges);
 			}
-
-            // Step 9: Mark cache as warmed after first successful fetch
-            if (isFirst) {
-                await markAsWarmed(env.CROWDSECCFBOUNCERNS);
-                logger.info('Cache marked as warmed after first fetch');
-            }
 
 			// Final summary
 			const finalDuration = ((Date.now() - startTime) / 1000).toFixed(2);
