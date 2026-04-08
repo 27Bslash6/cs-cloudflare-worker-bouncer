@@ -1,6 +1,10 @@
 package metrics
 
-import "github.com/prometheus/client_golang/prometheus"
+import (
+	"sync"
+
+	"github.com/prometheus/client_golang/prometheus"
+)
 
 const (
 	BlockedRequestMetricName   = "crowdsec_cloudflare_worker_bouncer_blocked_requests"
@@ -23,6 +27,10 @@ var TotalKeysByAccount = prometheus.NewGaugeVec(
 	},
 	[]string{"account"},
 )
+
+// MetricsMu protects LastBlockedRequestValue and LastProcessedRequestValue
+// from concurrent read/write between metricsUpdater and computeMetricsHandler goroutines.
+var MetricsMu sync.Mutex
 
 var TotalBlockedRequests = prometheus.NewGaugeVec(prometheus.GaugeOpts{
 	Name: BlockedRequestMetricName,

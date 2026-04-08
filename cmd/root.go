@@ -72,6 +72,9 @@ func (m *metricsHandler) metricsUpdater(met *models.RemediationComponentsMetrics
 		Items: make([]*models.MetricsDetailItem, 0),
 	})
 
+	metrics.MetricsMu.Lock()
+	defer metrics.MetricsMu.Unlock()
+
 	for _, metricFamily := range promMetrics {
 		for _, metric := range metricFamily.GetMetric() {
 			switch metricFamily.GetName() {
