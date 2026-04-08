@@ -3,6 +3,11 @@ import jwt from '@tsndr/cloudflare-worker-jwt'
 import { parse } from "cookie";
 
 
+const getTurnstileSecret = (env, domain) => {
+  const normalized = domain.replace(/[.\-]/g, '_').toUpperCase();
+  return env[`TURNSTILE_SECRET_${normalized}`] || null;
+}
+
 const getZoneFromReqURL = (reqURL, actionsByDomain) => {
   // loop through
   for (const [domain] of Object.entries(actionsByDomain)) {
@@ -116,12 +121,18 @@ export default {
       }
       turnstileCfg = turnstileCfg[zoneForThisRequest]
 
+      const turnstile_secret = getTurnstileSecret(env, zoneForThisRequest);
+      if (!turnstile_secret) {
+        console.log("No turnstile secret found for zone")
+        return fetch(request)
+      }
+
       const cookie = parse(request.headers.get("Cookie") || "");
       if (cookie[`${zoneForThisRequest}_captcha`] !== undefined) {
         console.log("captchaAuth cookie is present")
         // Check if the JWT token is valid
         try {
-          const decoded = await jwt.verify(cookie[`${zoneForThisRequest}_captcha`], turnstileCfg["secret"] + ip, {throwError: true});
+          const decoded = await jwt.verify(cookie[`${zoneForThisRequest}_captcha`], turnstile_secret + ip, {throwError: true});
           return fetch(request)
         } catch (err) {
           console.log(err)
@@ -132,7 +143,7 @@ export default {
         const formBody = await request.clone().formData();
         if (formBody.get('cf-turnstile-response')) {
           console.log("Handling turnstile post")
-          return await handleTurnstilePost(request, formBody, turnstileCfg["secret"], zoneForThisRequest)
+          return await handleTurnstilePost(request, formBody, turnstile_secret, zoneForThisRequest)
         }
       }
 
