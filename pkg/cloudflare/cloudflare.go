@@ -594,11 +594,16 @@ func (m *CloudflareAccountManager) ProcessDeletedDecisions(decisions []*models.D
 
 type WidgetTokenCfg struct {
 	SiteKey string `json:"site_key"`
-	Secret  string `json:"secret"`
+	Secret  string `json:"-"` // Never stored in KV; written to Workers Secrets
 }
 
 func (m *CloudflareAccountManager) writeWidgetCfgToKV(ctx context.Context, widgetTokenCfgByDomain map[string]WidgetTokenCfg) error {
-	turnstileConfig, err := json.Marshal(widgetTokenCfgByDomain)
+	// Write site keys (public) to KV — secrets are stored separately via Workers Secrets
+	kvData := make(map[string]map[string]string, len(widgetTokenCfgByDomain))
+	for domain, cfg := range widgetTokenCfgByDomain {
+		kvData[domain] = map[string]string{"site_key": cfg.SiteKey}
+	}
+	turnstileConfig, err := json.Marshal(kvData)
 	if err != nil {
 		return err
 	}
@@ -607,15 +612,41 @@ func (m *CloudflareAccountManager) writeWidgetCfgToKV(ctx context.Context, widge
 		Value: string(turnstileConfig),
 	}
 	m.logger.Infof("Writing turnstile cfg")
-	resp, err := m.api.WriteWorkersKVEntries(ctx, cf.AccountIdentifier(m.AccountCfg.ID), cf.WriteWorkersKVEntriesParams{
+	_, err = m.api.WriteWorkersKVEntries(ctx, cf.AccountIdentifier(m.AccountCfg.ID), cf.WriteWorkersKVEntriesParams{
 		NamespaceID: m.NamespaceID,
 		KVs:         []*cf.WorkersKVPair{&kv},
 	})
 	if err != nil {
 		return err
 	}
-	m.logger.Tracef("resp after writing turnstile cfg %+v", resp)
+
+	// Store each domain's secret as an encrypted Workers Secret
+	for domain, cfg := range widgetTokenCfgByDomain {
+		secretName := turnstileSecretName(domain)
+		_, err := m.api.SetWorkersSecret(ctx, cf.AccountIdentifier(m.AccountCfg.ID), cf.SetWorkersSecretParams{
+			ScriptName: m.Worker.ScriptName,
+			Secret: &cf.WorkersPutSecretRequest{
+				Name: secretName,
+				Text: cfg.Secret,
+				Type: "secret_text",
+			},
+		})
+		if err != nil {
+			return fmt.Errorf("failed to set turnstile secret for %s: %w", domain, err)
+		}
+		m.logger.Debugf("Turnstile secret stored as Workers Secret: %s", secretName)
+	}
+
+	m.logger.Tracef("Turnstile config written to KV")
 	return nil
+}
+
+// turnstileSecretName returns the Workers Secret env var name for a domain's turnstile secret.
+// The Worker JS reads this as env.TURNSTILE_SECRET_<normalized_domain>.
+func turnstileSecretName(domain string) string {
+	normalized := strings.ReplaceAll(domain, ".", "_")
+	normalized = strings.ReplaceAll(normalized, "-", "_")
+	return "TURNSTILE_SECRET_" + strings.ToUpper(normalized)
 }
 
 func (m *CloudflareAccountManager) ProcessNewDecisions(decisions []*models.Decision) error {
@@ -756,7 +787,7 @@ func (m *CloudflareAccountManager) CreateTurnstileWidgets() (map[string]WidgetTo
 			if err != nil {
 				return err
 			}
-			zoneLogger.Tracef("resp: %+v", resp)
+			zoneLogger.Tracef("Widget created: siteKey=%s", resp.SiteKey)
 			zoneLogger.Info(("Done creating turnstile widget"))
 			widgetTokenCfgByDomainLock.Lock()
 			defer widgetTokenCfgByDomainLock.Unlock()
@@ -819,7 +850,7 @@ func (m *CloudflareAccountManager) HandleTurnstile() error {
 						SiteKey:               widgetTokenCfg.SiteKey,
 						InvalidateImmediately: true,
 					})
-					zoneLogger.Tracef("resp: %+v", resp)
+					zoneLogger.Tracef("Widget rotated: siteKey=%s", widgetTokenCfg.SiteKey)
 					if err != nil {
 						return err
 					}
