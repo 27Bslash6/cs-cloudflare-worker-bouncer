@@ -271,7 +271,7 @@ func (m *CloudflareAccountManager) DeployDecisionsSyncWorker(crowdSecConfig cfg.
 
 	// Create bindings for the sync worker
 	bindings := map[string]cf.WorkerBinding{
-		m.Worker.KVNameSpaceName: cf.WorkerKvNamespaceBinding{NamespaceID: m.NamespaceID},
+		cfg.KVWorkerBindingName: cf.WorkerKvNamespaceBinding{NamespaceID: m.NamespaceID},
 		"LAPI_URL": cf.WorkerPlainTextBinding{
 			Text: crowdSecConfig.CrowdSecLAPIUrl,
 		},

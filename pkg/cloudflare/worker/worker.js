@@ -121,7 +121,7 @@ export default {
       if (typeof turnstileCfg === "string") {
         console.log("Converting turnstile config to JSON");
         turnstileCfg = JSON.parse(turnstileCfg);
-        writeToKV(env.CROWDSECCFBOUNCERNS, "TURNSTILE_CONFIG", turnstileCfg);
+        writeToKV(env.CROWDSECCFBOUNCERNS, "TURNSTILE_CONFIG", JSON.stringify(turnstileCfg));
       }
 
       if (!turnstileCfg[zoneForThisRequest]) {
@@ -305,9 +305,12 @@ export default {
     };
 
     const clientIP = request.headers.get("CF-Connecting-IP");
+    if (!clientIP) {
+      return fetch(request);
+    }
     const ipType = ipaddr.parse(clientIP).kind();
 
-    await incrementMetrics("processed", ipType);
+    ctx.waitUntil(incrementMetrics("processed", ipType));
 
     let remediation = await getRemediationForRequest(request, env);
     if (remediation === null) {
@@ -329,10 +332,10 @@ export default {
     console.log("Remediation for request is " + remediation);
     switch (remediation) {
       case "ban":
-        await incrementMetrics("dropped", ipType, "crowdsec", "ban");
+        ctx.waitUntil(incrementMetrics("dropped", ipType, "crowdsec", "ban"));
         return env.LOG_ONLY === "true" ? fetch(request) : await doBan();
       case "captcha":
-        await incrementMetrics("dropped", ipType, "crowdsec", "captcha");
+        ctx.waitUntil(incrementMetrics("dropped", ipType, "crowdsec", "captcha"));
         return env.LOG_ONLY === "true"
           ? fetch(request)
           : await doCaptcha(env, zoneForThisRequest);

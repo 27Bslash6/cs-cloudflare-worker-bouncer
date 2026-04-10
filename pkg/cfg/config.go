@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"slices"
 	"strings"
 	"time"
 
@@ -19,6 +20,13 @@ import (
 var (
 	VarNameForActionsByDomain = "ACTIONS_BY_DOMAIN"
 	ErrEmptyConfig            = errors.New("empty config")
+)
+
+// KVWorkerBindingName and D1WorkerBindingName are the worker env binding names hardcoded in the
+// compiled worker JS. They must not be changed without also updating the worker source.
+const (
+	KVWorkerBindingName = "CROWDSECCFBOUNCERNS"
+	D1WorkerBindingName = "CROWDSECCFBOUNCERDB"
 )
 
 type TurnstileConfig struct {
@@ -56,9 +64,9 @@ type CloudflareWorkerCreateParams struct {
 	CompatibilityDate       string   `yaml:"compatibility_date"`
 	CompatibilityFlags      []string `yaml:"compatibility_flags"`
 	LogOnly                 bool     `yaml:"log_only"`
-	KVNameSpaceName         string   `yaml:"-"` // Currently hardcoded string in worker code but may allow customization in future
-	D1DBName                string   `yaml:"-"` // Hardcoded, internal implementation detail for metrics support
-	DecisionsSyncScriptName string   `yaml:"-"` // Hardcoded, internal implementation detail for autonomous mode
+	KVNameSpaceName         string   `yaml:"kv_namespace_name,omitempty"`          // CF resource title used for create/delete lookup; change when sharing a Cloudflare account with another bouncer instance
+	D1DBName                string   `yaml:"d1_db_name,omitempty"`                 // CF D1 database name used for create/delete lookup; change when sharing a Cloudflare account with another bouncer instance
+	DecisionsSyncScriptName string   `yaml:"decisions_sync_script_name,omitempty"` // CF worker script name; change when sharing a Cloudflare account with another bouncer instance
 }
 
 func (w *CloudflareWorkerCreateParams) setDefaults() {
@@ -78,7 +86,7 @@ func (w *CloudflareWorkerCreateParams) setDefaults() {
 
 func (w *CloudflareWorkerCreateParams) CreateWorkerParams(workerScript string, id string, varActionsForZoneByDomain []byte, dbID string) cloudflare.CreateWorkerParams {
 	bindings := map[string]cloudflare.WorkerBinding{
-		w.KVNameSpaceName: cloudflare.WorkerKvNamespaceBinding{NamespaceID: id},
+		KVWorkerBindingName: cloudflare.WorkerKvNamespaceBinding{NamespaceID: id},
 		VarNameForActionsByDomain: cloudflare.WorkerPlainTextBinding{
 			Text: string(varActionsForZoneByDomain),
 		},
@@ -88,7 +96,7 @@ func (w *CloudflareWorkerCreateParams) CreateWorkerParams(workerScript string, i
 	}
 
 	if dbID != "" {
-		bindings[w.D1DBName] = cloudflare.WorkerD1DatabaseBinding{
+		bindings[D1WorkerBindingName] = cloudflare.WorkerD1DatabaseBinding{
 			DatabaseID: dbID,
 		}
 	}
@@ -214,12 +222,7 @@ func NewConfig(reader io.Reader) (*BouncerConfig, error) {
 }
 
 func stringSliceContains(slice []string, t string) bool {
-	for _, item := range slice {
-		if item == t {
-			return true
-		}
-	}
-	return false
+	return slices.Contains(slice, t)
 }
 
 func lineComment(l string, zoneByID map[string]cloudflare.Zone, accountByID map[string]cloudflare.Account) string {
@@ -248,6 +251,9 @@ func lineComment(l string, zoneByID map[string]cloudflare.Zone, accountByID map[
 	}
 	if strings.Contains(l, "turnstile:") {
 		return `Turnstile must be enabled if captcha action is used.`
+	}
+	if strings.Contains(l, "decisions_sync_script_name:") {
+		return `Decisions sync worker script name; change when running multiple bouncers on the same Cloudflare account`
 	}
 	if strings.Contains(l, "decisions_sync_worker:") {
 		return `Configuration for autonomous decisions sync worker`
@@ -280,7 +286,7 @@ func ConfigTokens(tokens string, baseConfigPath string) (string, error) {
 	accountByID := make(map[string]cloudflare.Account)
 	accountIDXByID := make(map[string]int)
 	ctx := context.Background()
-	for _, token := range strings.Split(tokens, ",") {
+	for token := range strings.SplitSeq(tokens, ",") {
 		api, err := cloudflare.NewWithAPIToken(token)
 		if err != nil {
 			return "", fmt.Errorf("failed to create cloudflare api client: %w", err)

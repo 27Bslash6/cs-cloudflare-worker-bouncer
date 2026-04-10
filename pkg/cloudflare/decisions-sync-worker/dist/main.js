@@ -6454,7 +6454,10 @@ async function resetAllDecisions(accountId, namespaceId, apiToken, kvNamespace) 
 					env.CF_API_TOKEN,
 					env.CROWDSECCFBOUNCERNS
 				);
-                // No need to handle WARMED_UP flag as there is no decisions at all
+				if (isFirst) {
+					await markAsWarmed(env.CROWDSECCFBOUNCERNS);
+					logger.info('Cache marked as warmed (LAPI has no decisions)');
+				}
 				const finalDuration = ((Date.now() - startTime) / 1000).toFixed(2);
 				logger.info('KV cleared successfully (LAPI has no decisions)', {
 					totalDuration: `${finalDuration}s`,
@@ -6467,6 +6470,12 @@ async function resetAllDecisions(accountId, namespaceId, apiToken, kvNamespace) 
 			// ====================
 
 			logger.info('Starting KV sync...');
+
+			// Mark as warmed before KV writes so a mid-sync exception doesn't trigger a full-sync storm
+			if (isFirst) {
+				await markAsWarmed(env.CROWDSECCFBOUNCERNS);
+				logger.info('Cache marked as warmed');
+			}
 
 			// Step 1: Get existing IP_RANGES from KV
 			const existingRanges = await getIpRanges(env.CROWDSECCFBOUNCERNS);
@@ -6531,12 +6540,6 @@ async function resetAllDecisions(accountId, namespaceId, apiToken, kvNamespace) 
 				logger.info('IP_RANGES changed, updating KV...');
 				await writeIpRanges(env.CROWDSECCFBOUNCERNS, finalRanges);
 			}
-
-            // Step 9: Mark cache as warmed after first successful fetch
-            if (isFirst) {
-                await markAsWarmed(env.CROWDSECCFBOUNCERNS);
-                logger.info('Cache marked as warmed after first fetch');
-            }
 
 			// Final summary
 			const finalDuration = ((Date.now() - startTime) / 1000).toFixed(2);
