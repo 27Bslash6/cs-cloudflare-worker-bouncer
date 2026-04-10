@@ -462,16 +462,13 @@ func (m *CloudflareAccountManager) cleanupKVNamespaces() error {
 }
 
 func (m *CloudflareAccountManager) cleanupD1Databases(start bool) error {
-	if !m.hasD1Access && !start {
-		return nil
-	}
-
 	m.logger.Debugf("Listing D1 DBs")
 	dbs, _, err := m.api.ListD1Databases(m.Ctx, cf.AccountIdentifier(m.AccountCfg.ID), cf.ListD1DatabasesParams{})
 
 	if err != nil {
 		if !start {
-			return fmt.Errorf("error while listing D1 DBs, make sure your token has the proper permissions: %w", err)
+			m.logger.Warnf("Unable to list D1 DBs during cleanup (token may lack D1 permissions): %s", err)
+			return nil
 		}
 		dbs = []cf.D1Database{}
 	}
