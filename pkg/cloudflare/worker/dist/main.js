@@ -7332,31 +7332,16 @@ const writeToKV = async (kv, key, value) => {
       return null;
     };
 
-    const incrementMetrics = async (
-      metricName,
-      ipType,
-      origin,
-      remediation_type,
-    ) => {
-      if (env.CROWDSECCFBOUNCERDB !== undefined) {
-        let parameters = [
-          metricName,
-          origin || "",
-          remediation_type || "",
-          ipType,
-        ];
-        let query = `
-          INSERT INTO metrics (val, metric_name, origin, remediation_type, ip_type)
-          VALUES (1, ?, ?, ?, ?)
-          ON CONFLICT(metric_name, origin, remediation_type, ip_type) DO UPDATE SET val=val+1
-        `;
-        try {
-          await env.CROWDSECCFBOUNCERDB.prepare(query)
-            .bind(...parameters)
-            .run();
-        } catch (error) {
-          console.error("Error incrementing metrics:", error);
-        }
+    const writeMetricEvent = (metricName, ipType, origin, remediationType) => {
+      if (!env.CROWDSECCFBOUNCER_AE) return;
+      try {
+        env.CROWDSECCFBOUNCER_AE.writeDataPoint({
+          indexes: [env.ACCOUNT_NAME || "default"],
+          blobs: [metricName, ipType, origin || "", remediationType || ""],
+          doubles: [1],
+        });
+      } catch (e) {
+        console.error("AE write failed:", e);
       }
     };
 
@@ -7366,7 +7351,7 @@ const writeToKV = async (kv, key, value) => {
     }
     const ipType = ipaddr.parse(clientIP).kind();
 
-    ctx.waitUntil(incrementMetrics("processed", ipType));
+    writeMetricEvent("processed", ipType);
 
     let remediation = await getRemediationForRequest(request, env);
     if (remediation === null) {
@@ -7388,10 +7373,10 @@ const writeToKV = async (kv, key, value) => {
     console.log("Remediation for request is " + remediation);
     switch (remediation) {
       case "ban":
-        ctx.waitUntil(incrementMetrics("dropped", ipType, "crowdsec", "ban"));
+        writeMetricEvent("dropped", ipType, "crowdsec", "ban");
         return env.LOG_ONLY === "true" ? fetch(request) : await doBan();
       case "captcha":
-        ctx.waitUntil(incrementMetrics("dropped", ipType, "crowdsec", "captcha"));
+        writeMetricEvent("dropped", ipType, "crowdsec", "captcha");
         return env.LOG_ONLY === "true"
           ? fetch(request)
           : await doCaptcha(env, zoneForThisRequest);

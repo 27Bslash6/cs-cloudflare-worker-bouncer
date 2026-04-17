@@ -22,11 +22,11 @@ var (
 	ErrEmptyConfig            = errors.New("empty config")
 )
 
-// KVWorkerBindingName and D1WorkerBindingName are the worker env binding names hardcoded in the
+// KVWorkerBindingName and AEWorkerBindingName are the worker env binding names hardcoded in the
 // compiled worker JS. They must not be changed without also updating the worker source.
 const (
 	KVWorkerBindingName = "CROWDSECCFBOUNCERNS"
-	D1WorkerBindingName = "CROWDSECCFBOUNCERDB"
+	AEWorkerBindingName = "CROWDSECCFBOUNCER_AE"
 )
 
 type TurnstileConfig struct {
@@ -65,7 +65,7 @@ type CloudflareWorkerCreateParams struct {
 	CompatibilityFlags      []string `yaml:"compatibility_flags"`
 	LogOnly                 bool     `yaml:"log_only"`
 	KVNameSpaceName         string   `yaml:"kv_namespace_name,omitempty"`          // CF resource title used for create/delete lookup; change when sharing a Cloudflare account with another bouncer instance
-	D1DBName                string   `yaml:"d1_db_name,omitempty"`                 // CF D1 database name used for create/delete lookup; change when sharing a Cloudflare account with another bouncer instance
+	AnalyticsDataset        string   `yaml:"analytics_dataset,omitempty"`          // CF Analytics Engine dataset name for metrics
 	DecisionsSyncScriptName string   `yaml:"decisions_sync_script_name,omitempty"` // CF worker script name; change when sharing a Cloudflare account with another bouncer instance
 }
 
@@ -76,15 +76,15 @@ func (w *CloudflareWorkerCreateParams) setDefaults() {
 	if w.KVNameSpaceName == "" {
 		w.KVNameSpaceName = "CROWDSECCFBOUNCERNS"
 	}
-	if w.D1DBName == "" {
-		w.D1DBName = "CROWDSECCFBOUNCERDB"
+	if w.AnalyticsDataset == "" {
+		w.AnalyticsDataset = "crowdsec_cloudflare_bouncer"
 	}
 	if w.DecisionsSyncScriptName == "" {
 		w.DecisionsSyncScriptName = "crowdsec-decisions-sync-worker"
 	}
 }
 
-func (w *CloudflareWorkerCreateParams) CreateWorkerParams(workerScript string, id string, varActionsForZoneByDomain []byte, dbID string) cloudflare.CreateWorkerParams {
+func (w *CloudflareWorkerCreateParams) CreateWorkerParams(workerScript string, id string, varActionsForZoneByDomain []byte, accountName string) cloudflare.CreateWorkerParams {
 	bindings := map[string]cloudflare.WorkerBinding{
 		KVWorkerBindingName: cloudflare.WorkerKvNamespaceBinding{NamespaceID: id},
 		VarNameForActionsByDomain: cloudflare.WorkerPlainTextBinding{
@@ -93,12 +93,12 @@ func (w *CloudflareWorkerCreateParams) CreateWorkerParams(workerScript string, i
 		"LOG_ONLY": cloudflare.WorkerPlainTextBinding{
 			Text: fmt.Sprintf("%t", w.LogOnly),
 		},
-	}
-
-	if dbID != "" {
-		bindings[D1WorkerBindingName] = cloudflare.WorkerD1DatabaseBinding{
-			DatabaseID: dbID,
-		}
+		AEWorkerBindingName: cloudflare.WorkerAnalyticsEngineBinding{
+			Dataset: w.AnalyticsDataset,
+		},
+		"ACCOUNT_NAME": cloudflare.WorkerPlainTextBinding{
+			Text: accountName,
+		},
 	}
 	return cloudflare.CreateWorkerParams{
 		Script:             workerScript,
