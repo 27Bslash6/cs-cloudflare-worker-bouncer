@@ -305,7 +305,15 @@ func Execute(opts ExecuteOptions) error {
 		return err
 	}
 	if opts.ShowConfig != nil && *opts.ShowConfig {
-		fmt.Fprintf(os.Stdout, "%+v", conf)
+		redacted := *conf
+		redacted.CrowdSecConfig.CrowdSecLAPIKey = "[REDACTED]"
+		redactedAccounts := make([]cfg.AccountConfig, len(conf.CloudflareConfig.Accounts))
+		copy(redactedAccounts, conf.CloudflareConfig.Accounts)
+		for i := range redactedAccounts {
+			redactedAccounts[i].Token = "[REDACTED]"
+		}
+		redacted.CloudflareConfig.Accounts = redactedAccounts
+		fmt.Fprintf(os.Stdout, "%+v", &redacted)
 		return nil
 	}
 
