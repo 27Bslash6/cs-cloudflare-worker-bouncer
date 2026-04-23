@@ -325,13 +325,19 @@ func Execute(opts ExecuteOptions) error {
 		CAPath:   conf.CrowdSecConfig.CAPath,
 	}
 
-	if (opts.TestConfig != nil && *opts.TestConfig) || (opts.SetupOnly == nil || !*opts.SetupOnly) || (opts.DeleteOnly == nil || !*opts.DeleteOnly) {
+	isSetupOnly := opts.SetupOnly != nil && *opts.SetupOnly
+	isDeleteOnly := opts.DeleteOnly != nil && *opts.DeleteOnly
+	isSetupAutonomous := opts.SetupAutonomous != nil && *opts.SetupAutonomous
+	isTestConfig := opts.TestConfig != nil && *opts.TestConfig
+
+	needsLAPI := isTestConfig || (!isSetupOnly && !isDeleteOnly && !isSetupAutonomous)
+	if needsLAPI {
 		if err := csLAPI.Init(); err != nil {
 			return fmt.Errorf("unable to initialize crowdsec bouncer: %w", err)
 		}
 	}
 
-	if opts.TestConfig != nil && *opts.TestConfig {
+	if isTestConfig {
 		log.Info("config is valid")
 		return nil
 	}
@@ -343,17 +349,15 @@ func Execute(opts ExecuteOptions) error {
 		return err
 	}
 
-	isDeleteOnly := opts.DeleteOnly != nil && *opts.DeleteOnly
-	isSetupAutonomous := opts.SetupAutonomous != nil && *opts.SetupAutonomous
 	deployInfraForManagers(g, cfManagers, isDeleteOnly, isSetupAutonomous, conf.CrowdSecConfig, conf.CloudflareConfig.DecisionsSyncWorker.Cron)
 	if err := g.Wait(); err != nil {
 		return err
 	}
-	if opts.DeleteOnly != nil && *opts.DeleteOnly {
+	if isDeleteOnly {
 		return nil
 	}
 	log.Info("Successfully deployed infra for all accounts")
-	if (opts.SetupOnly != nil && *opts.SetupOnly) || (opts.SetupAutonomous != nil && *opts.SetupAutonomous) {
+	if isSetupOnly || isSetupAutonomous {
 		return nil
 	}
 
