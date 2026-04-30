@@ -66,7 +66,19 @@ type CloudflareWorkerCreateParams struct {
 	LogOnly                 bool     `yaml:"log_only"`
 	KVNameSpaceName         string   `yaml:"kv_namespace_name,omitempty"`          // CF resource title used for create/delete lookup; change when sharing a Cloudflare account with another bouncer instance
 	AnalyticsDataset        string   `yaml:"analytics_dataset,omitempty"`          // CF Analytics Engine dataset name for metrics
-	DecisionsSyncScriptName string   `yaml:"decisions_sync_script_name,omitempty"` // CF worker script name; change when sharing a Cloudflare account with another bouncer instance
+	DecisionsSyncScriptName string                    `yaml:"decisions_sync_script_name,omitempty"` // CF worker script name; change when sharing a Cloudflare account with another bouncer instance
+	Observability           *WorkerObservabilityConfig `yaml:"observability,omitempty"`              // Workers Observability (logs + traces); nil = skip
+}
+
+type WorkerObservabilityConfig struct {
+	Enabled          *bool                `yaml:"enabled"`
+	HeadSamplingRate *float64             `yaml:"head_sampling_rate"`
+	Traces           *WorkerTracesConfig  `yaml:"traces,omitempty"`
+}
+
+type WorkerTracesConfig struct {
+	Enabled          *bool    `yaml:"enabled"`
+	HeadSamplingRate *float64 `yaml:"head_sampling_rate"`
 }
 
 func (w *CloudflareWorkerCreateParams) setDefaults() {
@@ -197,7 +209,7 @@ func NewConfig(reader io.Reader) (*BouncerConfig, error) {
 		}
 
 		for _, zone := range account.ZoneConfigs {
-			if !stringSliceContains(zone.Actions, zone.DefaultAction) {
+			if !slices.Contains(zone.Actions, zone.DefaultAction) {
 				zone.Actions = append(zone.Actions, zone.DefaultAction)
 			}
 			if len(zone.Actions) == 0 {
@@ -218,11 +230,19 @@ func NewConfig(reader io.Reader) (*BouncerConfig, error) {
 		}
 	}
 	config.CloudflareConfig.Worker.setDefaults() // set defaults for worker
-	return config, nil
-}
 
-func stringSliceContains(slice []string, t string) bool {
-	return slices.Contains(slice, t)
+	if obs := config.CloudflareConfig.Worker.Observability; obs != nil {
+		if r := obs.HeadSamplingRate; r != nil && (*r < 0 || *r > 1) {
+			return nil, fmt.Errorf("observability head_sampling_rate must be between 0 and 1, got %f", *r)
+		}
+		if obs.Traces != nil {
+			if r := obs.Traces.HeadSamplingRate; r != nil && (*r < 0 || *r > 1) {
+				return nil, fmt.Errorf("observability traces head_sampling_rate must be between 0 and 1, got %f", *r)
+			}
+		}
+	}
+
+	return config, nil
 }
 
 func lineComment(l string, zoneByID map[string]cloudflare.Zone, accountByID map[string]cloudflare.Account) string {
