@@ -1,0 +1,830 @@
+package cf
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"io"
+	"net/http"
+	"strings"
+	"sync"
+	"testing"
+	"time"
+
+	cf "github.com/cloudflare/cloudflare-go"
+	"github.com/prometheus/client_golang/prometheus"
+	dto "github.com/prometheus/client_model/go"
+	log "github.com/sirupsen/logrus"
+
+	"github.com/crowdsecurity/crowdsec-cloudflare-worker-bouncer/pkg/cfg"
+	"github.com/crowdsecurity/crowdsec-cloudflare-worker-bouncer/pkg/metrics"
+)
+
+// --- Test Infrastructure ---
+
+type roundTripFunc func(*http.Request) (*http.Response, error)
+
+func (f roundTripFunc) RoundTrip(r *http.Request) (*http.Response, error) { return f(r) }
+
+func gaugeValue(g prometheus.Gauge) float64 {
+	m := &dto.Metric{}
+	if err := g.Write(m); err != nil {
+		panic("failed to read gauge: " + err.Error())
+	}
+	return m.GetGauge().GetValue()
+}
+
+func makeAEResponseClient(data []map[string]any) *http.Client {
+	result := aeQueryResult{Data: data, Rows: len(data)}
+	respBody, err := json.Marshal(&result)
+	if err != nil {
+		panic("makeAEResponseClient: " + err.Error())
+	}
+	body := string(respBody)
+	return &http.Client{
+		Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+			_, _ = io.ReadAll(r.Body)
+			return &http.Response{
+				StatusCode: http.StatusOK,
+				Body:       io.NopCloser(strings.NewReader(body)),
+				Header:     make(http.Header),
+			}, nil
+		}),
+	}
+}
+
+func makeAEErrorClient(statusCode int, body string) *http.Client {
+	return &http.Client{
+		Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+			_, _ = io.ReadAll(r.Body)
+			return &http.Response{
+				StatusCode: statusCode,
+				Body:       io.NopCloser(strings.NewReader(body)),
+				Header:     make(http.Header),
+			}, nil
+		}),
+	}
+}
+
+type capturedRequest struct {
+	Request *http.Request
+	Body    string
+}
+
+func captureRequestClient(responseBody string) (*http.Client, *capturedRequest) {
+	captured := &capturedRequest{}
+	client := &http.Client{
+		Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+			captured.Request = r
+			body, _ := io.ReadAll(r.Body)
+			captured.Body = string(body)
+			return &http.Response{
+				StatusCode: http.StatusOK,
+				Body:       io.NopCloser(strings.NewReader(responseBody)),
+				Header:     make(http.Header),
+			}, nil
+		}),
+	}
+	return client, captured
+}
+
+func newTestManager() *CloudflareAccountManager {
+	return &CloudflareAccountManager{
+		AccountCfg: cfg.AccountConfig{
+			ID:    "test-account-id",
+			Token: "test-token",
+			Name:  "test-account",
+		},
+		Ctx:    context.Background(),
+		logger: log.WithFields(log.Fields{"account": "test-account"}),
+		Worker: &cfg.CloudflareWorkerCreateParams{
+			AnalyticsDataset: "test_dataset",
+		},
+		httpClient:        &http.Client{},
+		lastMetricsPoll:   time.Now().UTC().Add(-2 * time.Minute),
+		cumulativeMetrics: make(map[string]float64),
+	}
+}
+
+func resetMetrics() {
+	metrics.TotalProcessedRequests.Reset()
+	metrics.TotalBlockedRequests.Reset()
+}
+
+// --- Mock cloudflareAPI ---
+
+type mockCFAPI struct {
+	listD1DatabasesFn  func(context.Context, *cf.ResourceContainer, cf.ListD1DatabasesParams) ([]cf.D1Database, *cf.ResultInfo, error)
+	deleteD1DatabaseFn func(context.Context, *cf.ResourceContainer, string) error
+	deleteD1Calls      []string
+}
+
+func (*mockCFAPI) Account(_ context.Context, _ string) (cf.Account, cf.ResultInfo, error) {
+	return cf.Account{}, cf.ResultInfo{}, nil
+}
+func (*mockCFAPI) CreateTurnstileWidget(_ context.Context, _ *cf.ResourceContainer, _ cf.CreateTurnstileWidgetParams) (cf.TurnstileWidget, error) {
+	return cf.TurnstileWidget{}, nil
+}
+func (*mockCFAPI) CreateWorkerRoute(_ context.Context, _ *cf.ResourceContainer, _ cf.CreateWorkerRouteParams) (cf.WorkerRouteResponse, error) {
+	return cf.WorkerRouteResponse{}, nil
+}
+func (*mockCFAPI) CreateWorkersKVNamespace(_ context.Context, _ *cf.ResourceContainer, _ cf.CreateWorkersKVNamespaceParams) (cf.WorkersKVNamespaceResponse, error) {
+	return cf.WorkersKVNamespaceResponse{}, nil
+}
+func (*mockCFAPI) DeleteTurnstileWidget(_ context.Context, _ *cf.ResourceContainer, _ string) error {
+	return nil
+}
+func (*mockCFAPI) DeleteWorker(_ context.Context, _ *cf.ResourceContainer, _ cf.DeleteWorkerParams) error {
+	return nil
+}
+func (*mockCFAPI) DeleteWorkerRoute(_ context.Context, _ *cf.ResourceContainer, _ string) (cf.WorkerRouteResponse, error) {
+	return cf.WorkerRouteResponse{}, nil
+}
+func (*mockCFAPI) DeleteWorkersKVEntries(_ context.Context, _ *cf.ResourceContainer, _ cf.DeleteWorkersKVEntriesParams) (cf.Response, error) {
+	return cf.Response{}, nil
+}
+func (*mockCFAPI) DeleteWorkersKVNamespace(_ context.Context, _ *cf.ResourceContainer, _ string) (cf.Response, error) {
+	return cf.Response{}, nil
+}
+func (*mockCFAPI) ListTurnstileWidgets(_ context.Context, _ *cf.ResourceContainer, _ cf.ListTurnstileWidgetParams) ([]cf.TurnstileWidget, *cf.ResultInfo, error) {
+	return nil, nil, nil}
+func (*mockCFAPI) ListWorkerRoutes(_ context.Context, _ *cf.ResourceContainer, _ cf.ListWorkerRoutesParams) (cf.WorkerRoutesResponse, error) {
+	return cf.WorkerRoutesResponse{}, nil
+}
+func (*mockCFAPI) ListWorkersKVNamespaces(_ context.Context, _ *cf.ResourceContainer, _ cf.ListWorkersKVNamespacesParams) ([]cf.WorkersKVNamespace, *cf.ResultInfo, error) {
+	return nil, nil, nil}
+func (*mockCFAPI) ListWorkersSecrets(_ context.Context, _ *cf.ResourceContainer, _ cf.ListWorkersSecretsParams) (cf.WorkersListSecretsResponse, error) {
+	return cf.WorkersListSecretsResponse{}, nil
+}
+func (*mockCFAPI) ListZones(_ context.Context, _ ...string) ([]cf.Zone, error) {
+	return nil, nil}
+func (*mockCFAPI) RotateTurnstileWidget(_ context.Context, _ *cf.ResourceContainer, _ cf.RotateTurnstileWidgetParams) (cf.TurnstileWidget, error) {
+	return cf.TurnstileWidget{}, nil
+}
+func (*mockCFAPI) SetWorkersSecret(_ context.Context, _ *cf.ResourceContainer, _ cf.SetWorkersSecretParams) (cf.WorkersPutSecretResponse, error) {
+	return cf.WorkersPutSecretResponse{}, nil
+}
+func (*mockCFAPI) UploadWorker(_ context.Context, _ *cf.ResourceContainer, _ cf.CreateWorkerParams) (cf.WorkerScriptResponse, error) {
+	return cf.WorkerScriptResponse{}, nil
+}
+func (*mockCFAPI) UpdateWorkerCronTriggers(_ context.Context, _ *cf.ResourceContainer, _ cf.UpdateWorkerCronTriggersParams) ([]cf.WorkerCronTrigger, error) {
+	return nil, nil}
+func (*mockCFAPI) WriteWorkersKVEntries(_ context.Context, _ *cf.ResourceContainer, _ cf.WriteWorkersKVEntriesParams) (cf.Response, error) {
+	return cf.Response{}, nil
+}
+func (m *mockCFAPI) ListD1Databases(ctx context.Context, rc *cf.ResourceContainer, params cf.ListD1DatabasesParams) ([]cf.D1Database, *cf.ResultInfo, error) {
+	if m.listD1DatabasesFn != nil {
+		return m.listD1DatabasesFn(ctx, rc, params)
+	}
+	return nil, nil, nil
+}
+func (m *mockCFAPI) DeleteD1Database(ctx context.Context, rc *cf.ResourceContainer, databaseID string) error {
+	m.deleteD1Calls = append(m.deleteD1Calls, databaseID)
+	if m.deleteD1DatabaseFn != nil {
+		return m.deleteD1DatabaseFn(ctx, rc, databaseID)
+	}
+	return nil
+}
+
+// ============================================================
+// Group 1: queryAnalyticsEngine
+// ============================================================
+
+func TestQueryAnalyticsEngine_SendsRawSQL(t *testing.T) {
+	emptyResponse := `{"meta":[],"data":[],"rows":0}`
+	client, captured := captureRequestClient(emptyResponse)
+
+	m := newTestManager()
+	m.httpClient = client
+
+	query := "SELECT blob1 FROM test_dataset FORMAT JSON"
+	_, err := m.queryAnalyticsEngine(query)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	if captured.Request.Header.Get("Content-Type") != "text/plain" {
+		t.Errorf("Content-Type = %q, want text/plain", captured.Request.Header.Get("Content-Type"))
+	}
+	if captured.Request.Header.Get("Authorization") != "Bearer test-token" {
+		t.Errorf("Authorization = %q, want Bearer test-token", captured.Request.Header.Get("Authorization"))
+	}
+	if captured.Body != query {
+		t.Errorf("body = %q, want raw SQL %q", captured.Body, query)
+	}
+	wantURL := "https://api.cloudflare.com/client/v4/accounts/test-account-id/analytics_engine/sql"
+	if captured.Request.URL.String() != wantURL {
+		t.Errorf("URL = %q, want %q", captured.Request.URL.String(), wantURL)
+	}
+}
+
+func TestQueryAnalyticsEngine_HTTPError(t *testing.T) {
+	m := newTestManager()
+	m.httpClient = makeAEErrorClient(403, "Forbidden: invalid token")
+
+	_, err := m.queryAnalyticsEngine("SELECT 1")
+	if err == nil {
+		t.Fatal("expected error for HTTP 403")
+	}
+	if !strings.Contains(err.Error(), "403") {
+		t.Errorf("error should contain status code 403, got: %v", err)
+	}
+}
+
+func TestQueryAnalyticsEngine_InvalidJSON(t *testing.T) {
+	m := newTestManager()
+	m.httpClient = &http.Client{
+		Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+			_, _ = io.ReadAll(r.Body)
+			return &http.Response{
+				StatusCode: http.StatusOK,
+				Body:       io.NopCloser(strings.NewReader("not json")),
+				Header:     make(http.Header),
+			}, nil
+		}),
+	}
+
+	_, err := m.queryAnalyticsEngine("SELECT 1")
+	if err == nil {
+		t.Fatal("expected error for invalid JSON")
+	}
+	if !strings.Contains(err.Error(), "parse") {
+		t.Errorf("error should mention parsing, got: %v", err)
+	}
+}
+
+func TestQueryAnalyticsEngine_Success(t *testing.T) {
+	m := newTestManager()
+	m.httpClient = makeAEResponseClient([]map[string]any{
+		{"metric_name": "processed", "ip_type": "ipv4", "val": 42.0},
+	})
+
+	result, err := m.queryAnalyticsEngine("SELECT 1")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if result.Rows != 1 {
+		t.Errorf("Rows = %d, want 1", result.Rows)
+	}
+	if len(result.Data) != 1 {
+		t.Fatalf("Data length = %d, want 1", len(result.Data))
+	}
+	if result.Data[0]["metric_name"] != "processed" {
+		t.Errorf("metric_name = %v, want processed", result.Data[0]["metric_name"])
+	}
+}
+
+// ============================================================
+// Group 2: UpdateMetrics
+// ============================================================
+
+func TestUpdateMetrics_HappyPath(t *testing.T) {
+	resetMetrics()
+	m := newTestManager()
+	m.httpClient = makeAEResponseClient([]map[string]any{
+		{"metric_name": "processed", "ip_type": "ipv4", "origin": "", "remediation_type": "", "val": 100.0},
+		{"metric_name": "dropped", "ip_type": "ipv6", "origin": "crowdsec", "remediation_type": "ban", "val": 7.0},
+	})
+
+	if err := m.UpdateMetrics(); err != nil {
+		t.Fatalf("UpdateMetrics failed: %v", err)
+	}
+
+	processed := gaugeValue(metrics.TotalProcessedRequests.With(prometheus.Labels{
+		"ip_type": "ipv4", "account": "test-account",
+	}))
+	if processed != 100.0 {
+		t.Errorf("processed = %f, want 100", processed)
+	}
+
+	dropped := gaugeValue(metrics.TotalBlockedRequests.With(prometheus.Labels{
+		"origin": "crowdsec", "remediation": "ban", "ip_type": "ipv6", "account": "test-account",
+	}))
+	if dropped != 7.0 {
+		t.Errorf("dropped = %f, want 7", dropped)
+	}
+}
+
+func TestUpdateMetrics_CumulativeTracking(t *testing.T) {
+	resetMetrics()
+	m := newTestManager()
+
+	// First call: 10 processed
+	m.httpClient = makeAEResponseClient([]map[string]any{
+		{"metric_name": "processed", "ip_type": "ipv4", "origin": "", "remediation_type": "", "val": 10.0},
+		{"metric_name": "dropped", "ip_type": "ipv4", "origin": "crowdsec", "remediation_type": "ban", "val": 3.0},
+	})
+	if err := m.UpdateMetrics(); err != nil {
+		t.Fatalf("first UpdateMetrics failed: %v", err)
+	}
+
+	// Second call: 5 more processed
+	m.httpClient = makeAEResponseClient([]map[string]any{
+		{"metric_name": "processed", "ip_type": "ipv4", "origin": "", "remediation_type": "", "val": 5.0},
+		{"metric_name": "dropped", "ip_type": "ipv4", "origin": "crowdsec", "remediation_type": "ban", "val": 2.0},
+	})
+	if err := m.UpdateMetrics(); err != nil {
+		t.Fatalf("second UpdateMetrics failed: %v", err)
+	}
+
+	processed := gaugeValue(metrics.TotalProcessedRequests.With(prometheus.Labels{
+		"ip_type": "ipv4", "account": "test-account",
+	}))
+	if processed != 15.0 {
+		t.Errorf("processed = %f, want 15 (10+5)", processed)
+	}
+
+	dropped := gaugeValue(metrics.TotalBlockedRequests.With(prometheus.Labels{
+		"origin": "crowdsec", "remediation": "ban", "ip_type": "ipv4", "account": "test-account",
+	}))
+	if dropped != 5.0 {
+		t.Errorf("dropped = %f, want 5 (3+2)", dropped)
+	}
+}
+
+func TestUpdateMetrics_ConcurrentSafety(t *testing.T) {
+	resetMetrics()
+	m := newTestManager()
+	m.httpClient = makeAEResponseClient([]map[string]any{
+		{"metric_name": "processed", "ip_type": "ipv4", "origin": "", "remediation_type": "", "val": 1.0},
+	})
+
+	const goroutines = 20
+	var wg sync.WaitGroup
+	wg.Add(goroutines)
+	for range goroutines {
+		go func() {
+			defer wg.Done()
+			_ = m.UpdateMetrics()
+		}()
+	}
+	wg.Wait()
+
+	// Mutex serializes calls: each adds 1.0, total = 20.
+	// The -race flag validates no data races.
+	val := m.cumulativeMetrics["processed:ipv4:test-account"]
+	if val != float64(goroutines) {
+		t.Errorf("cumulative = %f, want %d", val, goroutines)
+	}
+}
+
+func TestUpdateMetrics_InvalidMetricName(t *testing.T) {
+	resetMetrics()
+	m := newTestManager()
+	m.httpClient = makeAEResponseClient([]map[string]any{
+		{"metric_name": 12345, "val": 1.0}, // metric_name is not a string
+	})
+
+	err := m.UpdateMetrics()
+	if err != nil {
+		t.Fatalf("should not return error for bad metric_name type: %v", err)
+	}
+}
+
+func TestUpdateMetrics_InvalidVal(t *testing.T) {
+	resetMetrics()
+	m := newTestManager()
+	m.httpClient = makeAEResponseClient([]map[string]any{
+		{"metric_name": "processed", "ip_type": "ipv4", "val": "not-a-number"},
+	})
+
+	err := m.UpdateMetrics()
+	if err != nil {
+		t.Fatalf("should not return error for bad val type: %v", err)
+	}
+}
+
+func TestUpdateMetrics_UnknownMetric(t *testing.T) {
+	resetMetrics()
+	m := newTestManager()
+	m.httpClient = makeAEResponseClient([]map[string]any{
+		{"metric_name": "unknown_metric", "ip_type": "ipv4", "origin": "", "remediation_type": "", "val": 1.0},
+	})
+
+	err := m.UpdateMetrics()
+	if err != nil {
+		t.Fatalf("unknown metric should not cause error: %v", err)
+	}
+}
+
+func TestUpdateMetrics_EmptyResult(t *testing.T) {
+	resetMetrics()
+	m := newTestManager()
+	m.httpClient = makeAEResponseClient(nil)
+
+	err := m.UpdateMetrics()
+	if err != nil {
+		t.Fatalf("empty result should not cause error: %v", err)
+	}
+	if len(m.cumulativeMetrics) != 0 {
+		t.Errorf("cumulative should be empty, got %v", m.cumulativeMetrics)
+	}
+}
+
+func TestUpdateMetrics_QueryError(t *testing.T) {
+	m := newTestManager()
+	originalPoll := m.lastMetricsPoll
+	m.httpClient = makeAEErrorClient(500, "internal server error")
+
+	err := m.UpdateMetrics()
+	if err == nil {
+		t.Fatal("expected error for HTTP 500")
+	}
+	if !m.lastMetricsPoll.Equal(originalPoll) {
+		t.Error("lastMetricsPoll should not advance on error")
+	}
+}
+
+func TestUpdateMetrics_AdvancesTimestamp(t *testing.T) {
+	m := newTestManager()
+	before := time.Now().UTC()
+	m.lastMetricsPoll = before.Add(-5 * time.Minute)
+	m.httpClient = makeAEResponseClient(nil)
+
+	if err := m.UpdateMetrics(); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	if !m.lastMetricsPoll.After(before.Add(-1 * time.Second)) {
+		t.Errorf("lastMetricsPoll should be ~now, got %v", m.lastMetricsPoll)
+	}
+}
+
+func TestUpdateMetrics_QueryContainsTimestamp(t *testing.T) {
+	emptyResp := `{"meta":[],"data":[],"rows":0}`
+	client, captured := captureRequestClient(emptyResp)
+
+	pollTime := time.Date(2025, 6, 15, 14, 30, 0, 0, time.UTC)
+	m := newTestManager()
+	m.lastMetricsPoll = pollTime
+	m.httpClient = client
+
+	_ = m.UpdateMetrics()
+
+	if !strings.Contains(captured.Body, "2025-06-15 14:30:00") {
+		t.Errorf("query should contain formatted timestamp, got:\n%s", captured.Body)
+	}
+	if !strings.Contains(captured.Body, "FROM test_dataset") {
+		t.Errorf("query should contain dataset name, got:\n%s", captured.Body)
+	}
+	if !strings.Contains(captured.Body, "FORMAT JSON") {
+		t.Errorf("query should contain FORMAT JSON, got:\n%s", captured.Body)
+	}
+}
+
+func TestUpdateMetrics_EscapesSingleQuotes(t *testing.T) {
+	emptyResp := `{"meta":[],"data":[],"rows":0}`
+	client, captured := captureRequestClient(emptyResp)
+
+	m := newTestManager()
+	m.AccountCfg.Name = "Ray's Account"
+	m.httpClient = client
+
+	_ = m.UpdateMetrics()
+
+	if strings.Contains(captured.Body, "Ray's Account") {
+		t.Error("unescaped single quote found in SQL query")
+	}
+	if !strings.Contains(captured.Body, `Ray\'s Account`) {
+		t.Errorf("expected escaped single quote in query, got:\n%s", captured.Body)
+	}
+}
+
+// ============================================================
+// Group 3: cleanupLegacyD1Databases
+// ============================================================
+
+func TestCleanupLegacyD1_FindsAndDeletes(t *testing.T) {
+	mock := &mockCFAPI{
+		listD1DatabasesFn: func(_ context.Context, _ *cf.ResourceContainer, _ cf.ListD1DatabasesParams) ([]cf.D1Database, *cf.ResultInfo, error) {
+			return []cf.D1Database{
+				{UUID: "db-legacy", Name: "CROWDSECCFBOUNCERDB"},
+				{UUID: "db-other", Name: "unrelated-database"},
+			}, nil, nil
+		},
+	}
+
+	m := newTestManager()
+	m.api = mock
+	m.cleanupLegacyD1Databases()
+
+	if len(mock.deleteD1Calls) != 1 {
+		t.Fatalf("expected 1 delete call, got %d", len(mock.deleteD1Calls))
+	}
+	if mock.deleteD1Calls[0] != "db-legacy" {
+		t.Errorf("deleted %q, want db-legacy", mock.deleteD1Calls[0])
+	}
+}
+
+func TestCleanupLegacyD1_NoneFound(t *testing.T) {
+	mock := &mockCFAPI{
+		listD1DatabasesFn: func(_ context.Context, _ *cf.ResourceContainer, _ cf.ListD1DatabasesParams) ([]cf.D1Database, *cf.ResultInfo, error) {
+			return []cf.D1Database{
+				{UUID: "db-other", Name: "unrelated-database"},
+			}, nil, nil
+		},
+	}
+
+	m := newTestManager()
+	m.api = mock
+	m.cleanupLegacyD1Databases()
+
+	if len(mock.deleteD1Calls) != 0 {
+		t.Errorf("expected 0 delete calls, got %d", len(mock.deleteD1Calls))
+	}
+}
+
+func TestCleanupLegacyD1_ListError(t *testing.T) {
+	mock := &mockCFAPI{
+		listD1DatabasesFn: func(_ context.Context, _ *cf.ResourceContainer, _ cf.ListD1DatabasesParams) ([]cf.D1Database, *cf.ResultInfo, error) {
+			return nil, nil, errors.New("permission denied")
+		},
+	}
+
+	m := newTestManager()
+	m.api = mock
+	// Should not panic or propagate error
+	m.cleanupLegacyD1Databases()
+
+	if len(mock.deleteD1Calls) != 0 {
+		t.Error("should not attempt deletes after list error")
+	}
+}
+
+func TestCleanupLegacyD1_DeleteError(t *testing.T) {
+	mock := &mockCFAPI{
+		listD1DatabasesFn: func(_ context.Context, _ *cf.ResourceContainer, _ cf.ListD1DatabasesParams) ([]cf.D1Database, *cf.ResultInfo, error) {
+			return []cf.D1Database{
+				{UUID: "db-legacy", Name: "CROWDSECCFBOUNCERDB"},
+			}, nil, nil
+		},
+		deleteD1DatabaseFn: func(_ context.Context, _ *cf.ResourceContainer, _ string) error {
+			return errors.New("delete failed")
+		},
+	}
+
+	m := newTestManager()
+	m.api = mock
+	// Should warn but not panic
+	m.cleanupLegacyD1Databases()
+
+	if len(mock.deleteD1Calls) != 1 {
+		t.Error("should have attempted delete despite failure")
+	}
+}
+
+// ============================================================
+// Group 4: Manager Initialization
+// ============================================================
+
+func TestManagerInit_LastMetricsPollSet(t *testing.T) {
+	m := newTestManager()
+	if m.lastMetricsPoll.IsZero() {
+		t.Error("lastMetricsPoll should not be zero")
+	}
+	elapsed := time.Since(m.lastMetricsPoll)
+	if elapsed > 3*time.Minute || elapsed < 1*time.Minute {
+		t.Errorf("lastMetricsPoll should be ~2min ago, got %v ago", elapsed)
+	}
+}
+
+func TestManagerInit_CumulativeMetricsMap(t *testing.T) {
+	m := newTestManager()
+	if m.cumulativeMetrics == nil {
+		t.Error("cumulativeMetrics should not be nil")
+	}
+	if len(m.cumulativeMetrics) != 0 {
+		t.Errorf("cumulativeMetrics should be empty, got %v", m.cumulativeMetrics)
+	}
+}
+
+func TestManagerInit_HttpClientSet(t *testing.T) {
+	m := newTestManager()
+	if m.httpClient == nil {
+		t.Error("httpClient should not be nil")
+	}
+}
+
+// obsFromBody extracts the observability section from a JSON request body.
+func obsFromBody(t *testing.T, rawBody string) map[string]any {
+	t.Helper()
+	var body map[string]any
+	if err := json.Unmarshal([]byte(rawBody), &body); err != nil {
+		t.Fatalf("body is not valid JSON: %v", err)
+	}
+	obs, ok := body["observability"].(map[string]any)
+	if !ok {
+		t.Fatal("body missing observability key")
+	}
+	return obs
+}
+
+func tracesFromObs(t *testing.T, obs map[string]any) map[string]any {
+	t.Helper()
+	traces, ok := obs["traces"].(map[string]any)
+	if !ok {
+		t.Fatal("body missing observability.traces key")
+	}
+	return traces
+}
+
+// --- Group 5: enableWorkerObservability ---
+
+func TestEnableObservability_NilConfig_Skipped(t *testing.T) {
+	m := newTestManager()
+	// Transport that fails if any request is made
+	m.httpClient = &http.Client{
+		Transport: roundTripFunc(func(_ *http.Request) (*http.Response, error) {
+			t.Fatal("no HTTP request should be made when observability is nil")
+			return nil, errors.New("unreachable")
+		}),
+	}
+	m.Worker.Observability = nil
+
+	if err := m.enableWorkerObservability("test-worker"); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+func TestEnableObservability_SendsCorrectRequest(t *testing.T) {
+	m := newTestManager()
+	client, captured := captureRequestClient(`{"success":true}`)
+	m.httpClient = client
+
+	enabled := true
+	rate := 1.0
+	m.Worker.Observability = &cfg.WorkerObservabilityConfig{
+		Enabled:          &enabled,
+		HeadSamplingRate: &rate,
+	}
+
+	if err := m.enableWorkerObservability("my-worker"); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	if captured.Request.Method != http.MethodPatch {
+		t.Errorf("method = %s, want PATCH", captured.Request.Method)
+	}
+	wantURL := "https://api.cloudflare.com/client/v4/accounts/test-account-id/workers/scripts/my-worker/script-settings"
+	if captured.Request.URL.String() != wantURL {
+		t.Errorf("URL = %s, want %s", captured.Request.URL.String(), wantURL)
+	}
+	if captured.Request.Header.Get("Authorization") != "Bearer test-token" {
+		t.Errorf("Authorization = %q, want %q", captured.Request.Header.Get("Authorization"), "Bearer test-token")
+	}
+	if captured.Request.Header.Get("Content-Type") != "application/json" {
+		t.Errorf("Content-Type = %q, want application/json", captured.Request.Header.Get("Content-Type"))
+	}
+
+	obs := obsFromBody(t, captured.Body)
+	if enabled, ok := obs["enabled"].(bool); !ok || !enabled {
+		t.Errorf("enabled = %v, want true", obs["enabled"])
+	}
+	if obs["head_sampling_rate"] != 1.0 {
+		t.Errorf("head_sampling_rate = %v, want 1", obs["head_sampling_rate"])
+	}
+
+	traces := tracesFromObs(t, obs)
+	if enabled, ok := traces["enabled"].(bool); !ok || !enabled {
+		t.Errorf("traces.enabled = %v, want true", traces["enabled"])
+	}
+	if traces["head_sampling_rate"] != 1.0 {
+		t.Errorf("traces.head_sampling_rate = %v, want 1", traces["head_sampling_rate"])
+	}
+}
+
+func TestEnableObservability_CustomSamplingRate(t *testing.T) {
+	m := newTestManager()
+	client, captured := captureRequestClient(`{"success":true}`)
+	m.httpClient = client
+
+	enabled := true
+	rate := 0.05
+	m.Worker.Observability = &cfg.WorkerObservabilityConfig{
+		Enabled:          &enabled,
+		HeadSamplingRate: &rate,
+	}
+
+	if err := m.enableWorkerObservability("my-worker"); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	obs := obsFromBody(t, captured.Body)
+	if obs["head_sampling_rate"] != 0.05 {
+		t.Errorf("head_sampling_rate = %v, want 0.05", obs["head_sampling_rate"])
+	}
+}
+
+func TestEnableObservability_HTTPError(t *testing.T) {
+	m := newTestManager()
+	m.httpClient = makeAEErrorClient(500, "internal server error")
+
+	enabled := true
+	m.Worker.Observability = &cfg.WorkerObservabilityConfig{Enabled: &enabled}
+
+	err := m.enableWorkerObservability("my-worker")
+	if err == nil {
+		t.Fatal("expected error for HTTP 500")
+	}
+	if !strings.Contains(err.Error(), "500") {
+		t.Errorf("error should contain status code: %v", err)
+	}
+}
+
+func TestEnableObservability_DefaultValues(t *testing.T) {
+	m := newTestManager()
+	client, captured := captureRequestClient(`{"success":true}`)
+	m.httpClient = client
+
+	// Non-nil config but both fields nil — should default to enabled=true, rate=1.0
+	m.Worker.Observability = &cfg.WorkerObservabilityConfig{}
+
+	if err := m.enableWorkerObservability("my-worker"); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	obs := obsFromBody(t, captured.Body)
+	if enabled, ok := obs["enabled"].(bool); !ok || !enabled {
+		t.Errorf("enabled = %v, want true (default)", obs["enabled"])
+	}
+	if obs["head_sampling_rate"] != 1.0 {
+		t.Errorf("head_sampling_rate = %v, want 1.0 (default)", obs["head_sampling_rate"])
+	}
+
+	// Traces should inherit top-level defaults
+	traces := tracesFromObs(t, obs)
+	if enabled, ok := traces["enabled"].(bool); !ok || !enabled {
+		t.Errorf("traces.enabled = %v, want true (default)", traces["enabled"])
+	}
+	if traces["head_sampling_rate"] != 1.0 {
+		t.Errorf("traces.head_sampling_rate = %v, want 1.0 (default)", traces["head_sampling_rate"])
+	}
+}
+
+func TestEnableObservability_NetworkError(t *testing.T) {
+	m := newTestManager()
+	m.httpClient = &http.Client{
+		Transport: roundTripFunc(func(_ *http.Request) (*http.Response, error) {
+			return nil, errors.New("connection refused")
+		}),
+	}
+	enabled := true
+	m.Worker.Observability = &cfg.WorkerObservabilityConfig{Enabled: &enabled}
+
+	err := m.enableWorkerObservability("my-worker")
+	if err == nil {
+		t.Fatal("expected error for network failure")
+	}
+	if !strings.Contains(err.Error(), "observability settings request failed") {
+		t.Errorf("error should mention request failure: %v", err)
+	}
+}
+
+func TestEnableObservability_CustomTracesConfig(t *testing.T) {
+	m := newTestManager()
+	client, captured := captureRequestClient(`{"success":true}`)
+	m.httpClient = client
+
+	enabled := true
+	logRate := 1.0
+	traceRate := 0.1
+	m.Worker.Observability = &cfg.WorkerObservabilityConfig{
+		Enabled:          &enabled,
+		HeadSamplingRate: &logRate,
+		Traces: &cfg.WorkerTracesConfig{
+			Enabled:          &enabled,
+			HeadSamplingRate: &traceRate,
+		},
+	}
+
+	if err := m.enableWorkerObservability("my-worker"); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	obs := obsFromBody(t, captured.Body)
+	if obs["head_sampling_rate"] != 1.0 {
+		t.Errorf("log sampling rate = %v, want 1.0", obs["head_sampling_rate"])
+	}
+	traces := tracesFromObs(t, obs)
+	if traces["head_sampling_rate"] != 0.1 {
+		t.Errorf("trace sampling rate = %v, want 0.1", traces["head_sampling_rate"])
+	}
+}
+
+func TestEnableObservability_ExplicitlyDisabled(t *testing.T) {
+	m := newTestManager()
+	client, captured := captureRequestClient(`{"success":true}`)
+	m.httpClient = client
+
+	enabled := false
+	m.Worker.Observability = &cfg.WorkerObservabilityConfig{Enabled: &enabled}
+
+	if err := m.enableWorkerObservability("my-worker"); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	obs := obsFromBody(t, captured.Body)
+	if enabled, ok := obs["enabled"].(bool); !ok || enabled {
+		t.Errorf("enabled = %v, want false", obs["enabled"])
+	}
+}
