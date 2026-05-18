@@ -5874,6 +5874,9 @@ async function fetchDecisionsStream(lapiUrl, apiKey, options = {}) {
 // String-based scopes (stored as individual KV entries)
 const STRING_SCOPES = ['ip', 'as', 'country'];
 
+// Valid decision types - unknown types are ignored for defence-in-depth
+const VALID_TYPES = ['ban', 'captcha'];
+
 /**
  * Helper function to process string-based decisions (IP, AS, Country)
  * @param {import('../types.js').Decision} decision - Decision object
@@ -5907,6 +5910,10 @@ function processNewDecisions(decisions, existingStringDecisions, existingRanges)
 	const jsonEntries = {}; // Aggregated JSON entries: Ranges
 
 	for (const decision of decisions) {
+		if (!VALID_TYPES.includes(decision.type)) {
+			logger.warn('Ignoring new decision with unknown type', { type: decision.type, value: decision.value });
+			continue;
+		}
 		if (STRING_SCOPES.includes(decision.scope)) {
 			// Handle string-based decisions (IP, AS, Country) - stored as individual KV entries
 			processStringDecision(decision, existingStringDecisions, stringEntries, decision.scope);

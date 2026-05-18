@@ -687,7 +687,13 @@ func (m *CloudflareAccountManager) ProcessNewDecisions(decisions []*models.Decis
 		newKVPairByValue[kvPair.Key] = kvPair
 	}
 
+	validDecisionTypes := map[string]bool{"ban": true, "captcha": true}
+
 	for _, decision := range decisions {
+		if !validDecisionTypes[*decision.Type] {
+			m.logger.Warnf("Ignoring decision with unknown type %q for %s", *decision.Type, *decision.Value)
+			continue
+		}
 		origin := *decision.Origin
 		if origin == "lists" {
 			origin = fmt.Sprintf("%s:%s", *decision.Origin, *decision.Scenario)
