@@ -454,15 +454,20 @@ func TestUpdateMetrics_QueryContainsTimestamp(t *testing.T) {
 	emptyResp := `{"meta":[],"data":[],"rows":0}`
 	client, captured := captureRequestClient(emptyResp)
 
-	pollTime := time.Date(2025, 6, 15, 14, 30, 0, 0, time.UTC)
+	// AE supports only second-precision toDateTime; the sub-second component
+	// of lastMetricsPoll is truncated in the lower bound.
+	pollTime := time.Date(2025, 6, 15, 14, 30, 0, 123000000, time.UTC)
 	m := newTestManager()
 	m.lastMetricsPoll = pollTime
 	m.httpClient = client
 
 	_ = m.UpdateMetrics()
 
-	if !strings.Contains(captured.Body, "2025-06-15 14:30:00") {
-		t.Errorf("query should contain formatted timestamp, got:\n%s", captured.Body)
+	if !strings.Contains(captured.Body, "timestamp >= toDateTime('2025-06-15 14:30:00')") {
+		t.Errorf("query should contain second-precision lower bound, got:\n%s", captured.Body)
+	}
+	if !strings.Contains(captured.Body, "timestamp < toDateTime(") {
+		t.Errorf("query should contain an upper window bound, got:\n%s", captured.Body)
 	}
 	if !strings.Contains(captured.Body, "FROM test_dataset") {
 		t.Errorf("query should contain dataset name, got:\n%s", captured.Body)
@@ -472,21 +477,25 @@ func TestUpdateMetrics_QueryContainsTimestamp(t *testing.T) {
 	}
 }
 
-func TestUpdateMetrics_EscapesSingleQuotes(t *testing.T) {
+func TestUpdateMetrics_QueryInterpolation_NoEscaping(t *testing.T) {
+	// Account name is allowlist-validated at config load (see pkg/cfg). The
+	// runtime query interpolates it directly without escaping; if a name
+	// containing a single quote ever reached this code path it would terminate
+	// the string literal and break the query, which is the failure we want.
 	emptyResp := `{"meta":[],"data":[],"rows":0}`
 	client, captured := captureRequestClient(emptyResp)
 
 	m := newTestManager()
-	m.AccountCfg.Name = "Ray's Account"
+	m.AccountCfg.Name = "acme-prod"
 	m.httpClient = client
 
 	_ = m.UpdateMetrics()
 
-	if strings.Contains(captured.Body, "Ray's Account") {
-		t.Error("unescaped single quote found in SQL query")
+	if !strings.Contains(captured.Body, "index1 = 'acme-prod'") {
+		t.Errorf("expected literal account name in WHERE clause, got:\n%s", captured.Body)
 	}
-	if !strings.Contains(captured.Body, `Ray\'s Account`) {
-		t.Errorf("expected escaped single quote in query, got:\n%s", captured.Body)
+	if strings.Contains(captured.Body, `\'`) {
+		t.Errorf("query should not contain backslash escapes (validation guarantees safe names), got:\n%s", captured.Body)
 	}
 }
 

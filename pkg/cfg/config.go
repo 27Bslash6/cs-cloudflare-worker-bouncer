@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"regexp"
 	"slices"
 	"strings"
 	"time"
@@ -20,6 +21,14 @@ import (
 var (
 	VarNameForActionsByDomain = "ACTIONS_BY_DOMAIN"
 	ErrEmptyConfig            = errors.New("empty config")
+)
+
+// validAccountName / validAnalyticsDataset enforce that values interpolated into
+// the AE SQL query cannot break out of a ClickHouse string literal or identifier
+// context. Rejecting at config load eliminates the need for runtime escaping.
+var (
+	validAccountName      = regexp.MustCompile(`^[\p{L}\p{N} ._\-()&+@:,]*$`)
+	validAnalyticsDataset = regexp.MustCompile(`^[a-zA-Z_][a-zA-Z0-9_]{0,63}$`)
 )
 
 // KVWorkerBindingName and AEWorkerBindingName are the worker env binding names hardcoded in the
@@ -198,7 +207,8 @@ func NewConfig(reader io.Reader) (*BouncerConfig, error) {
 	validAction := map[string]bool{"captcha": true, "ban": true}
 	validChoiceMsg := "valid choices are either of 'ban', 'captcha'"
 
-	for _, account := range config.CloudflareConfig.Accounts {
+	for i := range config.CloudflareConfig.Accounts {
+		account := &config.CloudflareConfig.Accounts[i]
 		if _, ok := accountIDSet[account.ID]; ok {
 			return nil, fmt.Errorf("the account '%s' is duplicated", account.ID)
 		}
@@ -206,6 +216,15 @@ func NewConfig(reader io.Reader) (*BouncerConfig, error) {
 
 		if account.Token == "" {
 			return nil, fmt.Errorf("the account '%s' is missing token", account.ID)
+		}
+
+		// Mirror the worker's `env.ACCOUNT_NAME || "default"` fallback: an empty
+		// name would query `index1 = ''` and never match what the worker writes.
+		if account.Name == "" {
+			account.Name = "default"
+		}
+		if !validAccountName.MatchString(account.Name) {
+			return nil, fmt.Errorf("account '%s' has invalid account_name %q: permitted characters are letters, digits, spaces, and . _ - ( ) & + @ : ,", account.ID, account.Name)
 		}
 
 		for _, zone := range account.ZoneConfigs {
@@ -230,6 +249,10 @@ func NewConfig(reader io.Reader) (*BouncerConfig, error) {
 		}
 	}
 	config.CloudflareConfig.Worker.setDefaults() // set defaults for worker
+
+	if !validAnalyticsDataset.MatchString(config.CloudflareConfig.Worker.AnalyticsDataset) {
+		return nil, fmt.Errorf("invalid analytics_dataset %q: must match %s", config.CloudflareConfig.Worker.AnalyticsDataset, validAnalyticsDataset.String())
+	}
 
 	if obs := config.CloudflareConfig.Worker.Observability; obs != nil {
 		if r := obs.HeadSamplingRate; r != nil && (*r < 0 || *r > 1) {
@@ -322,9 +345,19 @@ func ConfigTokens(tokens string, baseConfigPath string) (string, error) {
 		for _, account := range accounts {
 			accountByID[account.ID] = account
 			if _, ok := accountIDXByID[account.ID]; !ok {
+				// The Cloudflare-supplied account name flows into the AE SQL
+				// query, so it must satisfy validAccountName. A name that
+				// doesn't (e.g. "O'Brien") would generate a config that
+				// NewConfig rejects on the next startup — fall back to the
+				// account ID, which is always a safe identifier.
+				name := strings.Replace(account.Name, "'s Account", "", -1)
+				if !validAccountName.MatchString(name) {
+					log.Warnf("Cloudflare account name %q contains unsupported characters; using account ID %q as account_name", account.Name, account.ID)
+					name = account.ID
+				}
 				accountConfigs = append(accountConfigs, AccountConfig{
 					ID:          account.ID,
-					Name:        strings.Replace(account.Name, "'s Account", "", -1),
+					Name:        name,
 					ZoneConfigs: make([]*ZoneConfig, 0),
 					Token:       token,
 					BanTemplate: "",

@@ -74,7 +74,7 @@ func TestCreateWorkerParams_AEBinding(t *testing.T) {
 func TestCreateWorkerParams_AccountNameBinding(t *testing.T) {
 	w := &cfg.CloudflareWorkerCreateParams{}
 
-	params := w.CreateWorkerParams("script", "kv-ns-id", []byte(`{}`), "Ray's Account")
+	params := w.CreateWorkerParams("script", "kv-ns-id", []byte(`{}`), "Acme Corp")
 
 	binding, ok := params.Bindings["ACCOUNT_NAME"]
 	if !ok {
@@ -86,8 +86,8 @@ func TestCreateWorkerParams_AccountNameBinding(t *testing.T) {
 		t.Fatalf("ACCOUNT_NAME binding is %T, want WorkerPlainTextBinding", binding)
 	}
 
-	if ptBinding.Text != "Ray's Account" {
-		t.Fatalf("ACCOUNT_NAME = %q, want %q", ptBinding.Text, "Ray's Account")
+	if ptBinding.Text != "Acme Corp" {
+		t.Fatalf("ACCOUNT_NAME = %q, want %q", ptBinding.Text, "Acme Corp")
 	}
 }
 
@@ -223,5 +223,85 @@ cloudflare_config:
 	}
 	if !strings.Contains(err.Error(), "head_sampling_rate must be between 0 and 1") {
 		t.Errorf("unexpected error: %v", err)
+	}
+}
+
+// configWith builds a minimal valid bouncer config. A non-empty accountName is
+// injected as account_name; a non-empty dataset as worker.analytics_dataset.
+func configWith(accountName, dataset string) []byte {
+	worker := ""
+	if dataset != "" {
+		worker = "  worker:\n    analytics_dataset: \"" + dataset + "\"\n"
+	}
+	name := ""
+	if accountName != "" {
+		name = "      account_name: \"" + accountName + "\"\n"
+	}
+	return []byte("\n" +
+		"crowdsec_config:\n" +
+		"  lapi_url: http://localhost:8080/\n" +
+		"  lapi_key: test-key\n" +
+		"  update_frequency: 10s\n" +
+		"cloudflare_config:\n" +
+		worker +
+		"  accounts:\n" +
+		"    - id: acc1\n" +
+		"      token: tok1\n" +
+		name +
+		"      zones:\n" +
+		"        - zone_id: zone1\n" +
+		"          actions: [\"ban\"]\n" +
+		"          default_action: ban\n" +
+		"          routes_to_protect: [\"*example.com/*\"]\n")
+}
+
+func TestAccountName_RejectsInjectionCharacters(t *testing.T) {
+	// Each payload carries a character that can break out of the AE SQL string
+	// literal ( ' or \ ); validation must reject all of them at config load.
+	cases := map[string]string{
+		"single quote": `O'Brien`,
+		"backslash":    `foo\\bar`,
+		"injection":    `foo'; DROP TABLE users; --`,
+	}
+	for name, payload := range cases {
+		t.Run(name, func(t *testing.T) {
+			_, err := cfg.NewConfig(bytes.NewReader(configWith(payload, "")))
+			if err == nil || !strings.Contains(err.Error(), "invalid account_name") {
+				t.Fatalf("expected 'invalid account_name' rejection for %q, got: %v", payload, err)
+			}
+		})
+	}
+}
+
+func TestAccountName_AcceptsRealisticNames(t *testing.T) {
+	for _, name := range []string{"acme-prod", "Acme Corp", "Internal & External (prod)", "Acme + Co.", "owner@example.com"} {
+		t.Run(name, func(t *testing.T) {
+			if _, err := cfg.NewConfig(bytes.NewReader(configWith(name, ""))); err != nil {
+				t.Errorf("NewConfig rejected valid name %q: %v", name, err)
+			}
+		})
+	}
+}
+
+func TestAccountName_EmptyDefaultsToDefault(t *testing.T) {
+	// An omitted account_name must become "default" so the AE query's
+	// index1 filter matches the worker's `env.ACCOUNT_NAME || "default"`.
+	c, err := cfg.NewConfig(bytes.NewReader(configWith("", "")))
+	if err != nil {
+		t.Fatalf("NewConfig: %v", err)
+	}
+	if got := c.CloudflareConfig.Accounts[0].Name; got != "default" {
+		t.Errorf("empty account_name = %q, want \"default\"", got)
+	}
+}
+
+func TestAnalyticsDataset_RejectsInvalidIdentifiers(t *testing.T) {
+	for _, ds := range []string{"foo-bar", "foo bar", "1starts-with-digit", "foo;DROP", "foo'bar"} {
+		t.Run(ds, func(t *testing.T) {
+			_, err := cfg.NewConfig(bytes.NewReader(configWith("", ds)))
+			if err == nil || !strings.Contains(err.Error(), "invalid analytics_dataset") {
+				t.Fatalf("expected 'invalid analytics_dataset' rejection for %q, got: %v", ds, err)
+			}
+		})
 	}
 }
