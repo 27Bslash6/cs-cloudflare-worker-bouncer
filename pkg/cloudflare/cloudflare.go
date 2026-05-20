@@ -947,13 +947,16 @@ func (m *CloudflareAccountManager) UpdateMetrics() error {
 	defer m.metricsMu.Unlock()
 
 	m.logger.Debug("Getting metrics from Analytics Engine")
-	now := time.Now().UTC()
 
-	// Escape single quotes to prevent query breakage (e.g. "Ray's Account")
-	safeName := strings.ReplaceAll(m.AccountCfg.Name, "'", "\\'")
+	// AE only supports second-precision toDateTime. Query the half-open window
+	// [lastMetricsPoll, windowEnd) and advance the cursor to windowEnd so every
+	// second is counted exactly once. windowEnd excludes the in-progress second
+	// so events still arriving in it aren't undercounted — they land next poll.
+	windowEnd := time.Now().UTC().Truncate(time.Second)
 
 	// AE blob field mapping (must match writeMetricEvent in worker.js):
 	//   blob1 = metric_name, blob2 = ip_type, blob3 = origin, blob4 = remediation_type
+	// AnalyticsDataset and AccountCfg.Name are allowlist-validated at config load.
 	query := fmt.Sprintf(`SELECT
 		blob1 AS metric_name,
 		blob2 AS ip_type,
@@ -961,20 +964,22 @@ func (m *CloudflareAccountManager) UpdateMetrics() error {
 		blob4 AS remediation_type,
 		SUM(_sample_interval * double1) AS val
 	FROM %s
-	WHERE timestamp > toDateTime('%s')
+	WHERE timestamp >= toDateTime('%s')
+		AND timestamp < toDateTime('%s')
 		AND index1 = '%s'
 	GROUP BY metric_name, ip_type, origin, remediation_type
 	FORMAT JSON`,
 		m.Worker.AnalyticsDataset,
 		m.lastMetricsPoll.Format("2006-01-02 15:04:05"),
-		safeName,
+		windowEnd.Format("2006-01-02 15:04:05"),
+		m.AccountCfg.Name,
 	)
 
 	result, err := m.queryAnalyticsEngine(query)
 	if err != nil {
 		return fmt.Errorf("unable to query Analytics Engine: %w", err)
 	}
-	m.lastMetricsPoll = now
+	m.lastMetricsPoll = windowEnd
 	m.logger.Tracef("AE result: %+v", result)
 
 	for _, row := range result.Data {
