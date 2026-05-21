@@ -109,6 +109,8 @@ func newTestManager() *CloudflareAccountManager {
 func resetMetrics() {
 	metrics.TotalProcessedRequests.Reset()
 	metrics.TotalBlockedRequests.Reset()
+	metrics.AverageLatencyMs.Reset()
+	metrics.TotalErrors.Reset()
 }
 
 // --- Mock cloudflareAPI ---
@@ -282,8 +284,8 @@ func TestUpdateMetrics_HappyPath(t *testing.T) {
 	resetMetrics()
 	m := newTestManager()
 	m.httpClient = makeAEResponseClient([]map[string]any{
-		{"metric_name": "processed", "ip_type": "ipv4", "origin": "", "remediation_type": "", "val": 100.0},
-		{"metric_name": "dropped", "ip_type": "ipv6", "origin": "crowdsec", "remediation_type": "ban", "val": 7.0},
+		{"metric_name": "processed", "ip_type": "ipv4", "origin": "", "remediation_type": "", "val": 100.0, "avg_latency_ms": 12.5},
+		{"metric_name": "dropped", "ip_type": "ipv6", "origin": "crowdsec", "remediation_type": "ban", "val": 7.0, "avg_latency_ms": 45.0},
 	})
 
 	if err := m.UpdateMetrics(); err != nil {
@@ -302,6 +304,20 @@ func TestUpdateMetrics_HappyPath(t *testing.T) {
 	}))
 	if dropped != 7.0 {
 		t.Errorf("dropped = %f, want 7", dropped)
+	}
+
+	// Each grouped row gets its own label series — no last-row-wins.
+	processedLatency := gaugeValue(metrics.AverageLatencyMs.With(prometheus.Labels{
+		"account": "test-account", "metric_name": "processed", "ip_type": "ipv4", "remediation": "",
+	}))
+	if processedLatency != 12.5 {
+		t.Errorf("processed avg_latency_ms = %f, want 12.5", processedLatency)
+	}
+	droppedLatency := gaugeValue(metrics.AverageLatencyMs.With(prometheus.Labels{
+		"account": "test-account", "metric_name": "dropped", "ip_type": "ipv6", "remediation": "ban",
+	}))
+	if droppedLatency != 45.0 {
+		t.Errorf("dropped avg_latency_ms = %f, want 45", droppedLatency)
 	}
 }
 
@@ -407,6 +423,25 @@ func TestUpdateMetrics_UnknownMetric(t *testing.T) {
 	}
 }
 
+func TestUpdateMetrics_ErrorMetric(t *testing.T) {
+	resetMetrics()
+	m := newTestManager()
+	m.httpClient = makeAEResponseClient([]map[string]any{
+		{"metric_name": "error", "ip_type": "ipv4", "origin": "", "remediation_type": "", "val": 3.0},
+	})
+
+	if err := m.UpdateMetrics(); err != nil {
+		t.Fatalf("UpdateMetrics failed: %v", err)
+	}
+
+	errs := gaugeValue(metrics.TotalErrors.With(prometheus.Labels{
+		"ip_type": "ipv4", "account": "test-account",
+	}))
+	if errs != 3.0 {
+		t.Errorf("errors = %f, want 3", errs)
+	}
+}
+
 func TestUpdateMetrics_EmptyResult(t *testing.T) {
 	resetMetrics()
 	m := newTestManager()
@@ -475,6 +510,9 @@ func TestUpdateMetrics_QueryContainsTimestamp(t *testing.T) {
 	if !strings.Contains(captured.Body, "FORMAT JSON") {
 		t.Errorf("query should contain FORMAT JSON, got:\n%s", captured.Body)
 	}
+	if !strings.Contains(captured.Body, "AVG(double2) AS avg_latency_ms") {
+		t.Errorf("query should contain latency aggregation, got:\n%s", captured.Body)
+	}
 }
 
 func TestUpdateMetrics_QueryInterpolation_NoEscaping(t *testing.T) {
@@ -496,6 +534,26 @@ func TestUpdateMetrics_QueryInterpolation_NoEscaping(t *testing.T) {
 	}
 	if strings.Contains(captured.Body, `\'`) {
 		t.Errorf("query should not contain backslash escapes (validation guarantees safe names), got:\n%s", captured.Body)
+	}
+}
+
+func TestUpdateMetrics_MissingLatency_NoError(t *testing.T) {
+	resetMetrics()
+	m := newTestManager()
+	// AE row missing the avg_latency_ms field — defensive against partial responses.
+	m.httpClient = makeAEResponseClient([]map[string]any{
+		{"metric_name": "processed", "ip_type": "ipv4", "origin": "", "remediation_type": "", "val": 5.0},
+	})
+
+	if err := m.UpdateMetrics(); err != nil {
+		t.Fatalf("UpdateMetrics failed: %v", err)
+	}
+
+	processed := gaugeValue(metrics.TotalProcessedRequests.With(prometheus.Labels{
+		"ip_type": "ipv4", "account": "test-account",
+	}))
+	if processed != 5.0 {
+		t.Errorf("processed = %f, want 5", processed)
 	}
 }
 

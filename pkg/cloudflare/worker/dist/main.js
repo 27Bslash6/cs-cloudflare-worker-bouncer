@@ -7332,13 +7332,13 @@ const writeToKV = async (kv, key, value) => {
       return null;
     };
 
-    const writeMetricEvent = (metricName, ipType, origin, remediationType) => {
+    const writeMetricEvent = (metricName, ipType, origin, remediationType, latencyMs) => {
       if (!env.CROWDSECCFBOUNCER_AE) return;
       try {
         env.CROWDSECCFBOUNCER_AE.writeDataPoint({
           indexes: [env.ACCOUNT_NAME || "default"],
           blobs: [metricName, ipType, origin || "", remediationType || ""],
-          doubles: [1],
+          doubles: [1, latencyMs || 0],
         });
       } catch (e) {
         console.error("AE write failed:", e);
@@ -7351,37 +7351,66 @@ const writeToKV = async (kv, key, value) => {
     }
     const ipType = ipaddr.parse(clientIP).kind();
 
-    writeMetricEvent("processed", ipType);
+    const start = Date.now();
+    let origin = "";
+    let remediationType = "";
+    let blocked = false;
+    let errored = false;
+    let response;
 
-    let remediation = await getRemediationForRequest(request, env);
-    if (remediation === null) {
-      console.log("No remediation found for request");
-      return fetch(request);
-    }
-    if (typeof env.ACTIONS_BY_DOMAIN === "string") {
-      env.ACTIONS_BY_DOMAIN = JSON.parse(env.ACTIONS_BY_DOMAIN);
-    }
-    const zoneForThisRequest = getZoneFromReqURL(
-      request.url,
-      env.ACTIONS_BY_DOMAIN,
-    );
-    console.log("Zone for this request is " + zoneForThisRequest);
-    remediation = getSupportedActionForZone(
-      remediation,
-      env.ACTIONS_BY_DOMAIN[zoneForThisRequest],
-    );
-    console.log("Remediation for request is " + remediation);
-    switch (remediation) {
-      case "ban":
-        writeMetricEvent("dropped", ipType, "crowdsec", "ban");
-        return env.LOG_ONLY === "true" ? fetch(request) : await doBan();
-      case "captcha":
-        writeMetricEvent("dropped", ipType, "crowdsec", "captcha");
-        return env.LOG_ONLY === "true"
-          ? fetch(request)
-          : await doCaptcha(env, zoneForThisRequest);
-      default:
-        return fetch(request);
+    try {
+      let remediation = await getRemediationForRequest(request, env);
+      if (remediation === null) {
+        console.log("No remediation found for request");
+        response = await fetch(request);
+      } else {
+        if (typeof env.ACTIONS_BY_DOMAIN === "string") {
+          env.ACTIONS_BY_DOMAIN = JSON.parse(env.ACTIONS_BY_DOMAIN);
+        }
+        const zoneForThisRequest = getZoneFromReqURL(
+          request.url,
+          env.ACTIONS_BY_DOMAIN,
+        );
+        console.log("Zone for this request is " + zoneForThisRequest);
+        remediation = getSupportedActionForZone(
+          remediation,
+          env.ACTIONS_BY_DOMAIN[zoneForThisRequest],
+        );
+        console.log("Remediation for request is " + remediation);
+        switch (remediation) {
+          case "ban":
+            blocked = true;
+            origin = "crowdsec";
+            remediationType = "ban";
+            response = env.LOG_ONLY === "true" ? await fetch(request) : await doBan();
+            break;
+          case "captcha":
+            blocked = true;
+            origin = "crowdsec";
+            remediationType = "captcha";
+            response = env.LOG_ONLY === "true"
+              ? await fetch(request)
+              : await doCaptcha(env, zoneForThisRequest);
+            break;
+          default:
+            response = await fetch(request);
+        }
+      }
+      return response;
+    } catch (e) {
+      errored = true;
+      console.error("Worker handler exception:", e);
+      throw e;
+    } finally {
+      // Every request reaching here was processed; "dropped" and "error" are
+      // additional outcome tags so block-rate stays dropped/processed.
+      const latencyMs = Date.now() - start;
+      writeMetricEvent("processed", ipType, "", "", latencyMs);
+      if (errored) {
+        writeMetricEvent("error", ipType, "", "", latencyMs);
+      } else if (blocked) {
+        writeMetricEvent("dropped", ipType, origin, remediationType, latencyMs);
+      }
     }
   },
 });
