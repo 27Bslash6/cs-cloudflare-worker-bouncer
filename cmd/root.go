@@ -386,7 +386,8 @@ func Execute(opts ExecuteOptions) error {
 	})
 
 	prometheus.MustRegister(csbouncer.TotalLAPICalls, csbouncer.TotalLAPIError, metrics.CloudflareAPICallsByAccount, metrics.TotalKeysByAccount,
-		metrics.TotalActiveDecisions, metrics.TotalBlockedRequests, metrics.TotalProcessedRequests)
+		metrics.TotalActiveDecisions, metrics.TotalBlockedRequests, metrics.TotalProcessedRequests, metrics.AverageLatencyMs,
+		metrics.TotalErrors)
 	if conf.PrometheusConfig.Enabled {
 		g.Go(func() error {
 			http.Handle("/metrics", mHandler.computeMetricsHandler(promhttp.Handler()))

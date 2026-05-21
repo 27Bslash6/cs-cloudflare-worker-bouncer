@@ -954,15 +954,17 @@ func (m *CloudflareAccountManager) UpdateMetrics() error {
 	// so events still arriving in it aren't undercounted — they land next poll.
 	windowEnd := time.Now().UTC().Truncate(time.Second)
 
-	// AE blob field mapping (must match writeMetricEvent in worker.js):
+	// AE field mapping (must match writeMetricEvent in worker.js):
 	//   blob1 = metric_name, blob2 = ip_type, blob3 = origin, blob4 = remediation_type
+	//   double1 = count (1), double2 = latency_ms
 	// AnalyticsDataset and AccountCfg.Name are allowlist-validated at config load.
 	query := fmt.Sprintf(`SELECT
 		blob1 AS metric_name,
 		blob2 AS ip_type,
 		blob3 AS origin,
 		blob4 AS remediation_type,
-		SUM(_sample_interval * double1) AS val
+		SUM(_sample_interval * double1) AS val,
+		AVG(double2) AS avg_latency_ms
 	FROM %s
 	WHERE timestamp >= toDateTime('%s')
 		AND timestamp < toDateTime('%s')
@@ -1018,8 +1020,23 @@ func (m *CloudflareAccountManager) UpdateMetrics() error {
 				"origin": origin, "remediation": remediation,
 				"ip_type": ipType, "account": m.AccountCfg.Name,
 			}).Set(m.cumulativeMetrics[key])
+		case "error":
+			key := "error:" + ipType + ":" + m.AccountCfg.Name
+			m.cumulativeMetrics[key] += val
+			metrics.TotalErrors.With(prometheus.Labels{
+				"ip_type": ipType, "account": m.AccountCfg.Name,
+			}).Set(m.cumulativeMetrics[key])
 		default:
 			m.logger.Warnf("Unknown metric from AE: %s", metricName)
+		}
+
+		if latency, ok := row["avg_latency_ms"].(float64); ok {
+			metrics.AverageLatencyMs.With(prometheus.Labels{
+				"account":     m.AccountCfg.Name,
+				"metric_name": metricName,
+				"ip_type":     ipType,
+				"remediation": remediation,
+			}).Set(latency)
 		}
 	}
 
